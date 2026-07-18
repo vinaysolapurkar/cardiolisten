@@ -336,6 +336,45 @@ function bestWindowScore(clip: Float32Array, sampleRate: number, windowSeconds: 
   return best;
 }
 
+// ============ Live beat envelope detection ============
+// Purely visual — drives the ECG-style spike trace only. Does NOT feed the
+// pass/fail gate or the model input, so it doesn't need to be clinically
+// precise, only responsive and honest (no fake/randomized spikes).
+//
+// Tuned for ~60 calls/second (one call per animation frame), NOT per raw
+// audio sample — the caller (Task 4) feeds one representative amplitude
+// scalar per frame, not the full audio buffer.
+
+interface BeatEnvelopeState {
+  fastEnv: number;   // fast-attack/decay envelope of the rectified signal
+  slowEnv: number;   // slow rolling average; sets the adaptive threshold
+  lastBeatMs: number; // timestamp (ms) of the last fired beat
+}
+
+function initBeatEnvelopeState(): BeatEnvelopeState {
+  return { fastEnv: 0, slowEnv: 0, lastBeatMs: -Infinity };
+}
+
+// Feed one rectified (Math.abs) amplitude sample at time `nowMs`. A beat
+// fires when the fast envelope exceeds 1.8x the slow envelope, with a 150ms
+// refractory period — short enough to catch S1 ("lub") and S2 ("dub") as two
+// separate spikes per cardiac cycle, matching a real heart-sound trace.
+function processBeatEnvelopeSample(state: BeatEnvelopeState, sampleAbs: number, nowMs: number): { state: BeatEnvelopeState; beatDetected: boolean } {
+  const fastAlpha = 0.5;
+  const slowAlpha = 0.015;
+  const fastEnv = state.fastEnv + fastAlpha * (sampleAbs - state.fastEnv);
+  const slowEnv = state.slowEnv + slowAlpha * (sampleAbs - state.slowEnv);
+
+  const threshold = Math.max(slowEnv * 1.8, 0.01);
+  const refractoryOk = nowMs - state.lastBeatMs > 150;
+  const beatDetected = fastEnv > threshold && refractoryOk;
+
+  return {
+    state: { fastEnv, slowEnv, lastBeatMs: beatDetected ? nowMs : state.lastBeatMs },
+    beatDetected,
+  };
+}
+
 // ============ PPG Signal Processing ============
 
 function smoothSignal(signal: number[], windowSize: number): number[] {
