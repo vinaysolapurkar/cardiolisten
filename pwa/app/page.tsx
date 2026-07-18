@@ -279,6 +279,63 @@ function resampleAudio(input: Float32Array, srcRate: number, dstRate: number): F
   return out;
 }
 
+// ============ Heart sound window quality scoring ============
+// Shared by: (a) the per-zone 10s pass/fail gate, and (b) the final best-5
+// window selection before model inference. Moderate, non-clipping RMS
+// combined with low coefficient-of-variation of energy across 10 sub-chunks
+// (steady recording condition, not jumpy handling noise) scores highest.
+
+interface WindowScore { score: number; rms: number }
+interface ScoredWindow extends WindowScore { start: number }
+
+function scoreAudioWindow(segment: Float32Array | Float64Array): WindowScore {
+  let rms = 0;
+  for (let i = 0; i < segment.length; i++) rms += segment[i] * segment[i];
+  rms = Math.sqrt(rms / segment.length);
+  if (rms < 0.0005) return { score: 0, rms };
+
+  const chunkSize = Math.floor(segment.length / 10);
+  const chunkEnergies: number[] = [];
+  for (let c = 0; c < 10; c++) {
+    let e = 0;
+    for (let i = c * chunkSize; i < (c + 1) * chunkSize; i++) e += segment[i] * segment[i];
+    chunkEnergies.push(e / chunkSize);
+  }
+  const meanEnergy = chunkEnergies.reduce((a, b) => a + b, 0) / chunkEnergies.length;
+  const variance = chunkEnergies.reduce((s, e) => s + (e - meanEnergy) ** 2, 0) / chunkEnergies.length;
+  const cv = Math.sqrt(variance) / (meanEnergy + 1e-10);
+
+  const rmsScore = rms > 0.001 && rms < 0.5 ? 1 : 0.3;
+  const cvScore = Math.max(0, 1 - cv * 2);
+  return { score: rmsScore * cvScore, rms };
+}
+
+// Slides scoreAudioWindow across `clip` at the given window/hop size
+// (seconds). Skips near-silent windows (rms < 0.0005) entirely — matches the
+// original inline behavior. Returns every kept window plus how many total
+// slide positions were attempted (kept + skipped), for debug reporting.
+function scoreAudioWindows(clip: Float32Array, sampleRate: number, windowSeconds: number, hopSeconds: number): { windows: ScoredWindow[]; totalWindows: number } {
+  const windowSize = Math.round(sampleRate * windowSeconds);
+  const hopSize = Math.max(1, Math.round(sampleRate * hopSeconds));
+  const windows: ScoredWindow[] = [];
+  let totalWindows = 0;
+  for (let start = 0; start + windowSize <= clip.length; start += hopSize) {
+    totalWindows++;
+    const s = scoreAudioWindow(clip.subarray(start, start + windowSize));
+    if (s.rms < 0.0005) continue;
+    windows.push({ start, ...s });
+  }
+  return { windows, totalWindows };
+}
+
+// Best (highest-score) window found in `clip`; { score: 0, rms: 0 } if none.
+function bestWindowScore(clip: Float32Array, sampleRate: number, windowSeconds: number, hopSeconds: number): WindowScore {
+  const { windows } = scoreAudioWindows(clip, sampleRate, windowSeconds, hopSeconds);
+  let best: WindowScore = { score: 0, rms: 0 };
+  for (const w of windows) if (w.score > best.score) best = w;
+  return best;
+}
+
 // ============ PPG Signal Processing ============
 
 function smoothSignal(signal: number[], windowSize: number): number[] {
@@ -891,35 +948,7 @@ export default function Home() {
       const debugBase = `recorded ${(audioBuffer.length / audioBuffer.sampleRate).toFixed(1)}s @ ${audioBuffer.sampleRate}Hz, ` +
         `mic level: peak ${(rawMax * 100).toFixed(0)}% / rms ${(rawRms * 100).toFixed(1)}%`;
 
-      const windowSize = SAMPLE_RATE * SEGMENT_DURATION;
-      const hopSize = Math.floor(windowSize / 2);
-      interface WindowScore { start: number; score: number; rms: number }
-      const windowScores: WindowScore[] = [];
-      let totalWindows = 0;
-
-      for (let start = 0; start + windowSize <= resampled.length; start += hopSize) {
-        totalWindows++;
-        const segment = resampled.subarray(start, start + windowSize);
-        let rms = 0;
-        for (let i = 0; i < segment.length; i++) rms += segment[i] * segment[i];
-        rms = Math.sqrt(rms / segment.length);
-        if (rms < 0.0005) continue;
-
-        const chunkSize = Math.floor(segment.length / 10);
-        const chunkEnergies: number[] = [];
-        for (let c = 0; c < 10; c++) {
-          let e = 0;
-          for (let i = c * chunkSize; i < (c + 1) * chunkSize; i++) e += segment[i] * segment[i];
-          chunkEnergies.push(e / chunkSize);
-        }
-        const meanEnergy = chunkEnergies.reduce((a, b) => a + b, 0) / chunkEnergies.length;
-        const variance = chunkEnergies.reduce((s, e) => s + (e - meanEnergy) ** 2, 0) / chunkEnergies.length;
-        const cv = Math.sqrt(variance) / (meanEnergy + 1e-10);
-
-        const rmsScore = rms > 0.001 && rms < 0.5 ? 1 : 0.3;
-        const cvScore = Math.max(0, 1 - cv * 2);
-        windowScores.push({ start, score: rmsScore * cvScore, rms });
-      }
+      const { windows: windowScores, totalWindows } = scoreAudioWindows(resampled, SAMPLE_RATE, SEGMENT_DURATION, SEGMENT_DURATION / 2);
 
       if (windowScores.length === 0) {
         const msg = `${debugBase}, ${totalWindows} windows all below silence threshold (rms<0.0005) - mic likely picked up almost nothing`;
@@ -930,9 +959,10 @@ export default function Home() {
         return;
       }
 
-      windowScores.sort((a, b) => b.score - a.score);
-      const bestWindows = windowScores.slice(0, Math.min(5, windowScores.length));
+      const sortedWindows = windowScores.slice().sort((a, b) => b.score - a.score);
+      const bestWindows = sortedWindows.slice(0, Math.min(5, sortedWindows.length));
       const norm = normRef.current!;
+      const windowSize = SAMPLE_RATE * SEGMENT_DURATION;
       const segmentResults: { normal: number; abnormal: number; score: number }[] = [];
 
       for (const win of bestWindows) {
