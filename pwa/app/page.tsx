@@ -43,6 +43,21 @@ interface SoundResult {
   quality: number; // 0..1 best-window quality
 }
 
+// On-device diagnostics so real hardware failures can be diagnosed from a
+// screenshot instead of guessed at. Not used in the HR/label math.
+interface PulseDiag {
+  torchCapable: boolean;
+  exposureCapable: boolean;
+  exposureLockState: "n/a" | "locked" | "failed" | "pending";
+  r: number; g: number; b: number;
+  fps: number;
+  ampPP: number; // peak-to-peak of the filtered signal, last ~2s
+}
+interface SoundDiag {
+  level: number; // 0..1 live RMS of raw mic input
+  peak: number;  // 0..1 running max
+}
+
 // ============ FFT (iterative radix-2, in-place) ============
 // Operates on interleaved-free re/im arrays; length must be a power of 2.
 function fftRadix2(re: Float64Array, im: Float64Array): void {
@@ -460,12 +475,15 @@ export default function Home() {
   const [torchOn, setTorchOn] = useState(false);
   const [liveHR, setLiveHR] = useState<number | null>(null);
   const [ppgWaveform, setPpgWaveform] = useState<number[]>([]);
+  const [pulseDiag, setPulseDiag] = useState<PulseDiag | null>(null);
 
   // Sound state
   const [soundState, setSoundState] = useState<SoundState>("idle");
   const [soundResult, setSoundResult] = useState<SoundResult | null>(null);
   const [soundCountdown, setSoundCountdown] = useState(RECORD_DURATION);
   const [soundWaveform, setSoundWaveform] = useState<number[]>([]);
+  const [soundDiag, setSoundDiag] = useState<SoundDiag | null>(null);
+  const [soundDebug, setSoundDebug] = useState<string | null>(null);
 
   // Refs
   const modelRef = useRef<tf.LayersModel | null>(null);
@@ -480,12 +498,17 @@ export default function Home() {
   const ppgStreamRef = useRef<MediaStream | null>(null);
   const ppgStartRef = useRef<number>(0);
   const lastLiveHRRef = useRef<number>(0);
+  const ppgTrackRef = useRef<MediaStreamTrack | null>(null);
+  const exposureLockAttemptedRef = useRef(false);
+  const stableFingerSinceRef = useRef<number | null>(null);
+  const diagLastUpdateRef = useRef(0);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const audioStreamRef = useRef<MediaStream | null>(null);
   const soundTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const soundAnimRef = useRef<number>(0);
   const soundCtxRef = useRef<AudioContext | null>(null);
+  const soundLevelPeakRef = useRef(0);
 
   // Load model
   useEffect(() => {
@@ -508,7 +531,10 @@ export default function Home() {
     setPpgWaveform([]);
     setLiveHR(null);
     setTorchOn(false);
+    setPulseDiag(null);
     lastLiveHRRef.current = 0;
+    exposureLockAttemptedRef.current = false;
+    stableFingerSinceRef.current = null;
 
     try {
       // Prefer a real rear camera (torch usually only exists on the back camera)
@@ -528,18 +554,26 @@ export default function Home() {
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
       ppgStreamRef.current = stream;
 
-      // Engage the torch/flash and verify it actually turned on
+      // Engage the torch/flash and verify it actually turned on. Torch control
+      // via the web platform is known to be unreliable on some Android
+      // devices even when getCapabilities() reports it — verify via
+      // getSettings() rather than trusting the applyConstraints() resolve.
       const track = stream.getVideoTracks()[0];
-      const caps = (track.getCapabilities?.() ?? {}) as MediaTrackCapabilities & { torch?: boolean };
+      ppgTrackRef.current = track;
+      const caps = (track.getCapabilities?.() ?? {}) as MediaTrackCapabilities & {
+        torch?: boolean; exposureMode?: string[]; whiteBalanceMode?: string[];
+      };
+      const exposureCapable = Array.isArray(caps.exposureMode) && caps.exposureMode.includes("manual");
       if (caps.torch) {
         try {
           await track.applyConstraints({ advanced: [{ torch: true } as MediaTrackConstraintSet] });
           const settings = (track.getSettings?.() ?? {}) as MediaTrackSettings & { torch?: boolean };
-          setTorchOn(settings.torch !== false);
+          setTorchOn(settings.torch === true);
         } catch { setTorchOn(false); }
       } else {
         setTorchOn(false);
       }
+      setPulseDiag({ torchCapable: !!caps.torch, exposureCapable, exposureLockState: exposureCapable ? "pending" : "n/a", r: 0, g: 0, b: 0, fps: 0, ampPP: 0 });
 
       setPulseState("measuring");
       await new Promise(r => setTimeout(r, 150));
@@ -571,8 +605,11 @@ export default function Home() {
           for (let i = 0; i < d.length; i += 4) { rSum += d[i]; gSum += d[i + 1]; bSum += d[i + 2]; count++; }
           const rAvg = rSum / count, gAvg = gSum / count, bAvg = bSum / count;
 
-          // Finger over a flash-lit lens => red dominates and is bright
-          const isFinger = rAvg > 90 && rAvg > gAvg * 1.25 && rAvg > bAvg * 1.25;
+          // Finger over a flash-lit lens => red dominates and is bright.
+          // Without a working flash the frame is much dimmer, so also accept
+          // a looser "red-dominant" match at lower brightness (ambient light
+          // through the fingertip) rather than only the flash-lit case.
+          const isFinger = rAvg > gAvg * 1.15 && rAvg > bAvg * 1.15 && rAvg > 40;
           setFingerDetected(isFinger);
 
           ppgValsRef.current.push(rAvg);
@@ -586,6 +623,50 @@ export default function Home() {
             const mean = recent.reduce((a, b) => a + b, 0) / recent.length;
             ppgFilteredRef.current.push(rAvg - mean);
             setPpgWaveform([...ppgFilteredRef.current]);
+          }
+
+          // Once the finger signal looks stable and bright for ~1.2s, lock
+          // exposure so the phone's auto-exposure stops fighting the pulse
+          // signal (this is the single biggest known cause of bad
+          // camera-PPG accuracy on Android). Attempted once per session.
+          const now = performance.now();
+          if (isFinger) {
+            if (stableFingerSinceRef.current === null) stableFingerSinceRef.current = now;
+          } else {
+            stableFingerSinceRef.current = null;
+          }
+          if (!exposureLockAttemptedRef.current && stableFingerSinceRef.current !== null &&
+              now - stableFingerSinceRef.current > 1200 && ppgTrackRef.current) {
+            exposureLockAttemptedRef.current = true;
+            const t = ppgTrackRef.current;
+            (async () => {
+              try {
+                // exposureMode and exposureTime must be applied in separate
+                // calls — the mode switch has to land before a time can stick.
+                await t.applyConstraints({ advanced: [{ exposureMode: "manual" } as MediaTrackConstraintSet] });
+                const settings = (t.getSettings?.() ?? {}) as MediaTrackSettings & { exposureMode?: string };
+                const ok = settings.exposureMode === "manual";
+                setPulseDiag(d => d ? { ...d, exposureLockState: ok ? "locked" : "failed" } : d);
+              } catch {
+                setPulseDiag(d => d ? { ...d, exposureLockState: "failed" } : d);
+              }
+            })();
+          }
+
+          // Throttled diagnostics readout (~4/s) so the on-screen panel is
+          // legible instead of refreshing every camera frame.
+          if (now - diagLastUpdateRef.current > 250) {
+            diagLastUpdateRef.current = now;
+            const times = ppgTimesRef.current;
+            let fps = 0;
+            if (times.length > 10) {
+              const recentT = times.slice(-30);
+              const span = recentT[recentT.length - 1] - recentT[0];
+              fps = span > 0 ? ((recentT.length - 1) * 1000) / span : 0;
+            }
+            const recentFiltered = ppgFilteredRef.current.slice(-60);
+            const ampPP = recentFiltered.length > 1 ? Math.max(...recentFiltered) - Math.min(...recentFiltered) : 0;
+            setPulseDiag(d => d ? { ...d, r: Math.round(rAvg), g: Math.round(gAvg), b: Math.round(bAvg), fps, ampPP } : d);
           }
         }
       };
@@ -643,6 +724,7 @@ export default function Home() {
     if (vAny?.cancelVideoFrameCallback) vAny.cancelVideoFrameCallback(ppgRafRef.current);
     cancelAnimationFrame(ppgRafRef.current);
     if (ppgStreamRef.current) ppgStreamRef.current.getTracks().forEach(t => t.stop());
+    ppgTrackRef.current = null;
 
     setPulseState("processing");
     const vals = ppgValsRef.current, times = ppgTimesRef.current;
@@ -670,8 +752,11 @@ export default function Home() {
   const startSound = useCallback(async () => {
     setError(null);
     setSoundResult(null);
+    setSoundDiag(null);
+    setSoundDebug(null);
     audioChunksRef.current = [];
     setSoundWaveform([]);
+    soundLevelPeakRef.current = 0;
 
     try {
       // Record RAW mic audio (no AGC/NS/EC) so features match the training
@@ -700,12 +785,30 @@ export default function Home() {
       };
 
       const waveData = new Float32Array(analyser.fftSize);
+      let lastDiagUpdate = 0;
       const updateWaveform = () => {
         analyser.getFloatTimeDomainData(waveData);
         const step = Math.floor(waveData.length / 50);
         const points: number[] = [];
         for (let i = 0; i < waveData.length; i += step) points.push(waveData[i]);
         setSoundWaveform(prev => [...prev, ...points].slice(-WAVEFORM_POINTS * 2));
+
+        // Live mic level meter (RMS + running peak) so a too-quiet or
+        // clipping recording is visible on screen instead of discovered
+        // after the fact from a failed classification.
+        const now = performance.now();
+        if (now - lastDiagUpdate > 200) {
+          lastDiagUpdate = now;
+          let sumSq = 0, peak = 0;
+          for (let i = 0; i < waveData.length; i++) {
+            const v = waveData[i];
+            sumSq += v * v;
+            if (Math.abs(v) > peak) peak = Math.abs(v);
+          }
+          const rms = Math.sqrt(sumSq / waveData.length);
+          soundLevelPeakRef.current = Math.max(soundLevelPeakRef.current * 0.98, peak);
+          setSoundDiag({ level: rms, peak: soundLevelPeakRef.current });
+        }
         soundAnimRef.current = requestAnimationFrame(updateWaveform);
       };
       updateWaveform();
@@ -746,12 +849,20 @@ export default function Home() {
       // Anti-aliased resample to the model's 2 kHz (matches librosa.load(sr=2000))
       const resampled = resampleAudio(rawData, audioBuffer.sampleRate, SAMPLE_RATE);
 
+      let rawMax = 0, rawSumSq = 0;
+      for (let i = 0; i < rawData.length; i++) { const a = Math.abs(rawData[i]); if (a > rawMax) rawMax = a; rawSumSq += rawData[i] * rawData[i]; }
+      const rawRms = Math.sqrt(rawSumSq / rawData.length);
+      const debugBase = `recorded ${(audioBuffer.length / audioBuffer.sampleRate).toFixed(1)}s @ ${audioBuffer.sampleRate}Hz, ` +
+        `mic level: peak ${(rawMax * 100).toFixed(0)}% / rms ${(rawRms * 100).toFixed(1)}%`;
+
       const windowSize = SAMPLE_RATE * SEGMENT_DURATION;
       const hopSize = Math.floor(windowSize / 2);
       interface WindowScore { start: number; score: number; rms: number }
       const windowScores: WindowScore[] = [];
+      let totalWindows = 0;
 
       for (let start = 0; start + windowSize <= resampled.length; start += hopSize) {
+        totalWindows++;
         const segment = resampled.subarray(start, start + windowSize);
         let rms = 0;
         for (let i = 0; i < segment.length; i++) rms += segment[i] * segment[i];
@@ -775,6 +886,7 @@ export default function Home() {
       }
 
       if (windowScores.length === 0) {
+        setSoundDebug(`${debugBase}, ${totalWindows} windows all below silence threshold (rms<0.0005) — mic likely picked up almost nothing`);
         setError("No usable audio detected. Record again in a quiet room with the mic pressed to your chest.");
         setSoundState("idle");
         return;
@@ -822,9 +934,11 @@ export default function Home() {
         segmentsAnalyzed: segmentResults.length,
         quality: bestQuality,
       });
+      setSoundDebug(`${debugBase}, ${windowScores.length}/${totalWindows} windows usable, best window rms ${(bestWindows[0]?.rms * 100 || 0).toFixed(2)}%`);
       setSoundState("done");
     } catch (e) {
       console.error(e);
+      setSoundDebug(prev => prev ?? "Recording failed to decode — check microphone permission and try again.");
       setError("Audio processing failed.");
       setSoundState("idle");
     }
@@ -897,6 +1011,14 @@ export default function Home() {
                   <div className="bg-rose-500 h-1 rounded-full transition-all" style={{ width: `${((PPG_DURATION - pulseCountdown) / PPG_DURATION) * 100}%` }} />
                 </div>
 
+                {pulseDiag && (
+                  <div className="bg-slate-900/60 rounded-lg p-2 border border-slate-700/50 text-[10px] text-slate-400 font-mono leading-relaxed">
+                    <div>torch: {pulseDiag.torchCapable ? (torchOn ? "on ✓" : "capable but NOT on ✗") : "not supported on this camera ✗"}</div>
+                    <div>exposure lock: {pulseDiag.exposureLockState === "n/a" ? "not supported ✗" : pulseDiag.exposureLockState === "locked" ? "locked ✓" : pulseDiag.exposureLockState === "failed" ? "attempted, failed ✗" : "waiting for stable finger..."}</div>
+                    <div>R:{pulseDiag.r} G:{pulseDiag.g} B:{pulseDiag.b} &middot; fps:{pulseDiag.fps.toFixed(1)} &middot; signal amp:{pulseDiag.ampPP.toFixed(1)}</div>
+                  </div>
+                )}
+
                 <button onClick={stopPPG} className="w-full py-2 bg-slate-700 hover:bg-slate-600 rounded-xl text-sm font-medium transition-colors">
                   Stop &amp; Analyze
                 </button>
@@ -918,6 +1040,11 @@ export default function Home() {
                   <div className="text-[10px] text-slate-500 mt-1">
                     Signal quality: {pulseResult.quality > 0.4 ? "good" : pulseResult.quality > 0.2 ? "fair" : "low"} &middot; {Math.round(pulseResult.fs)} fps
                   </div>
+                  {pulseDiag && (
+                    <div className="text-[9px] text-slate-600 font-mono mt-1">
+                      torch:{pulseDiag.torchCapable ? (torchOn ? "on" : "off✗") : "n/a"} exp-lock:{pulseDiag.exposureLockState} R:{pulseDiag.r} G:{pulseDiag.g} B:{pulseDiag.b}
+                    </div>
+                  )}
                 </div>
                 <div className="grid grid-cols-2 gap-2">
                   <div className="bg-slate-700/50 rounded-xl p-3 text-center">
@@ -993,6 +1120,20 @@ export default function Home() {
 
                 <LiveWaveform data={soundWaveform} color="#3b82f6" height={140} />
 
+                {soundDiag && (
+                  <div className="bg-slate-900/60 rounded-lg p-2 border border-slate-700/50">
+                    <div className="flex justify-between text-[10px] text-slate-400 mb-1">
+                      <span>mic level</span>
+                      <span className={soundDiag.peak > 0.9 ? "text-red-400" : soundDiag.peak < 0.02 ? "text-amber-400" : "text-green-400"}>
+                        {soundDiag.peak > 0.9 ? "clipping ✗" : soundDiag.peak < 0.02 ? "too quiet ✗" : "OK ✓"} (peak {(soundDiag.peak * 100).toFixed(0)}%)
+                      </span>
+                    </div>
+                    <div className="h-1.5 bg-slate-700 rounded-full overflow-hidden">
+                      <div className={`h-full rounded-full transition-all ${soundDiag.peak > 0.9 ? "bg-red-500" : "bg-blue-500"}`} style={{ width: `${Math.min(100, soundDiag.peak * 100)}%` }} />
+                    </div>
+                  </div>
+                )}
+
                 <div className="w-full bg-slate-700 rounded-full h-1">
                   <div className="bg-blue-500 h-1 rounded-full transition-all" style={{ width: `${((RECORD_DURATION - soundCountdown) / RECORD_DURATION) * 100}%` }} />
                 </div>
@@ -1027,6 +1168,7 @@ export default function Home() {
                   <p className="text-slate-400 text-xs mt-1">Confidence: {(soundResult.confidence * 100).toFixed(1)}%</p>
                   <p className="text-slate-500 text-xs">Best {soundResult.segmentsAnalyzed} segments &middot; recording quality {soundResult.quality > 0.5 ? "good" : soundResult.quality > 0.25 ? "fair" : "low"}</p>
                   {soundResult.quality < 0.25 && <p className="text-amber-400/80 text-[11px] mt-1">Low-quality recording &mdash; result may be unreliable, try again in a quiet room.</p>}
+                  {soundDebug && <p className="text-slate-600 text-[9px] font-mono mt-1">{soundDebug}</p>}
                 </div>
                 <div className="w-full space-y-2">
                   <div>
@@ -1120,6 +1262,14 @@ export default function Home() {
         <div className="mt-3 p-3 bg-red-500/10 border border-red-500/30 rounded-lg text-red-400 text-sm max-w-sm text-center">
           {error}
           <button onClick={() => setError(null)} className="ml-2 underline text-xs">dismiss</button>
+          {pulseDiag && tab === "pulse" && (
+            <div className="mt-2 pt-2 border-t border-red-500/20 text-[9px] text-red-300/70 font-mono text-left">
+              torch:{pulseDiag.torchCapable ? (torchOn ? "on" : "off✗") : "n/a"} exp-lock:{pulseDiag.exposureLockState} R:{pulseDiag.r} G:{pulseDiag.g} B:{pulseDiag.b} fps:{pulseDiag.fps.toFixed(1)} amp:{pulseDiag.ampPP.toFixed(1)}
+            </div>
+          )}
+          {soundDebug && tab === "sound" && (
+            <div className="mt-2 pt-2 border-t border-red-500/20 text-[9px] text-red-300/70 font-mono text-left">{soundDebug}</div>
+          )}
         </div>
       )}
 
