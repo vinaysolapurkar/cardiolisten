@@ -1509,6 +1509,27 @@ export default function Home() {
               </div>
             )}
 
+            {soundState === "all_zones_failed" && (
+              <div className="flex flex-col items-center gap-4">
+                <div className="w-14 h-14 rounded-full bg-amber-500/10 border-2 border-amber-500/40 flex items-center justify-center">
+                  <svg className="w-7 h-7 text-amber-400" fill="none" stroke="currentColor" strokeWidth={2.5} viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M12 9v4m0 4h.01M12 2a10 10 0 100 20 10 10 0 000-20z" /></svg>
+                </div>
+                <div className="text-center">
+                  <p className="text-slate-300 text-sm font-medium">Couldn't get a clean signal at any spot</p>
+                  <p className="text-slate-500 text-xs mt-1">You can use the best of the 3 recordings anyway (result may be less reliable), or try the guided check again.</p>
+                </div>
+                <button onClick={useBestZoneAnyway} className="w-full py-3 bg-blue-500 hover:bg-blue-600 rounded-xl font-semibold transition-colors">
+                  Use best spot anyway
+                </button>
+                <button onClick={retryGuidedFlow} className="w-full py-2 bg-slate-700 hover:bg-slate-600 rounded-xl text-sm font-medium transition-colors">
+                  Try again
+                </button>
+                <button onClick={stopGuidedFlow} className="text-slate-500 text-xs underline">
+                  Cancel
+                </button>
+              </div>
+            )}
+
             {soundState === "processing" && (
               <div className="flex flex-col items-center gap-4 py-8">
                 <div className="w-12 h-12 border-4 border-blue-500 border-t-transparent rounded-full animate-spin" />
