@@ -280,7 +280,8 @@ function smoothSignal(signal: number[], windowSize: number): number[] {
 }
 
 function detrendSignal(signal: number[], fps: number): number[] {
-  const trendWindow = Math.max(3, Math.round(fps * 1.5));
+  // ~1s moving-average high-pass to suppress slow motion/breathing sway
+  const trendWindow = Math.max(3, Math.round(fps * 1.0));
   const trend = smoothSignal(signal, trendWindow);
   return signal.map((v, i) => v - trend[i]);
 }
@@ -312,8 +313,13 @@ function resampleUniform(values: number[], timesMs: number[]): { signal: number[
   return { signal: out, fs };
 }
 
-// FFT-based heart rate on a uniformly-sampled signal at known fps.
-// Returns BPM and the normalized peak prominence (quality proxy).
+// Heart rate from a uniformly-sampled signal at known fps, using a
+// harmonic-product criterion: score(k) = mag[k] * mag[2k]. A real pulse is
+// sharply non-sinusoidal so it always carries a 2nd harmonic; a lone
+// low-frequency motion/breathing peak (shaky hand after exercise) does not, so
+// it scores ~0 and is rejected. This also rejects octave-halving. We stop at
+// the 2nd harmonic on purpose: including the 3rd would let motion near f/3 drop
+// its harmonic onto the true pulse and steal the reading.
 function fftHeartRate(signal: number[], fps: number): { bpm: number; quality: number } {
   const N = signal.length;
   if (N < 8) return { bpm: 0, quality: 0 };
@@ -330,23 +336,25 @@ function fftHeartRate(signal: number[], fps: number): { bpm: number; quality: nu
   const mag = new Float64Array(halfN);
   for (let k = 0; k < halfN; k++) mag[k] = Math.hypot(re[k], im[k]);
 
-  // Search 0.7-3.3 Hz (42-198 BPM)
+  // Search fundamentals in 0.7-3.3 Hz (42-198 BPM)
   const minBin = Math.max(1, Math.floor((0.7 * fftSize) / fps));
   const maxBin = Math.min(halfN - 1, Math.ceil((3.3 * fftSize) / fps));
-  let peakBin = minBin, peakMag = 0, sumMag = 0, cnt = 0;
+  let bestBin = minBin, bestScore = -1, sumMag = 0, cnt = 0;
+  for (let k = minBin; k <= maxBin; k++) { sumMag += mag[k]; cnt++; }
   for (let k = minBin; k <= maxBin; k++) {
-    sumMag += mag[k]; cnt++;
-    if (mag[k] > peakMag) { peakMag = mag[k]; peakBin = k; }
+    const h2 = 2 * k < halfN ? mag[2 * k] : 0;
+    const score = mag[k] * h2;
+    if (score > bestScore) { bestScore = score; bestBin = k; }
   }
   const meanMag = cnt > 0 ? sumMag / cnt : 1;
-  const quality = meanMag > 0 ? Math.min(1, (peakMag / meanMag - 1) / 8) : 0;
+  const quality = meanMag > 0 ? Math.min(1, (mag[bestBin] / meanMag - 1) / 8) : 0;
 
-  // Parabolic interpolation for sub-bin accuracy
-  let interpBin = peakBin;
-  if (peakBin > 0 && peakBin < halfN - 1) {
-    const a = mag[peakBin - 1], b = mag[peakBin], c = mag[peakBin + 1];
+  // Parabolic interpolation on the raw magnitude around the chosen fundamental
+  let interpBin = bestBin;
+  if (bestBin > 0 && bestBin < halfN - 1) {
+    const a = mag[bestBin - 1], b = mag[bestBin], c = mag[bestBin + 1];
     const denom = a - 2 * b + c;
-    if (denom !== 0) interpBin = peakBin + (0.5 * (a - c)) / denom;
+    if (denom !== 0) interpBin = bestBin + (0.5 * (a - c)) / denom;
   }
   const freqHz = (interpBin * fps) / fftSize;
   return { bpm: Math.round(freqHz * 60), quality: Math.max(0, quality) };
@@ -372,7 +380,7 @@ function analyzePPG(values: number[], timesMs: number[]): PulseResult {
   const trimmed = uniform.slice(settle);
 
   const detrended = detrendSignal(trimmed, fs);
-  const smoothed = smoothSignal(detrended, Math.max(2, Math.round(fs / 6)));
+  const smoothed = smoothSignal(detrended, Math.max(2, Math.round(fs / 8)));
 
   const { bpm: hr, quality } = fftHeartRate(smoothed, fs);
 
@@ -616,7 +624,7 @@ export default function Home() {
           try {
             const { signal, fs } = resampleUniform(wv, wt);
             const detr = detrendSignal(signal, fs);
-            const sm = smoothSignal(detr, Math.max(2, Math.round(fs / 6)));
+            const sm = smoothSignal(detr, Math.max(2, Math.round(fs / 8)));
             const { bpm } = fftHeartRate(sm, fs);
             if (bpm >= 40 && bpm <= 200) { setLiveHR(bpm); lastLiveHRRef.current = bpm; }
           } catch {}
