@@ -432,6 +432,24 @@ function analyzePPG(values: number[], timesMs: number[]): PulseResult {
   return { hr, hrv, rrIntervals, irregularity, rhythm, quality, fs, signal: displaySignal };
 }
 
+// ============ Diagnostics history (localStorage) ============
+// Every attempt (pulse or sound, success or failure) appends one line here so
+// the user can copy the whole run history in one tap instead of screenshotting
+// tiny on-screen text after every single attempt.
+const DIAG_LOG_KEY = "cardiolisten_diag_log";
+function pushDiagLog(line: string) {
+  try {
+    const now = new Date().toISOString().replace("T", " ").slice(0, 19);
+    const existing: string[] = JSON.parse(localStorage.getItem(DIAG_LOG_KEY) || "[]");
+    existing.push(`[${now}] ${line}`);
+    while (existing.length > 20) existing.shift();
+    localStorage.setItem(DIAG_LOG_KEY, JSON.stringify(existing));
+  } catch {}
+}
+function readDiagLog(): string[] {
+  try { return JSON.parse(localStorage.getItem(DIAG_LOG_KEY) || "[]"); } catch { return []; }
+}
+
 // ============ Live Waveform Component ============
 
 function LiveWaveform({ data, color, height = 80 }: { data: number[]; color: string; height?: number }) {
@@ -472,10 +490,22 @@ export default function Home() {
   const [pulseResult, setPulseResult] = useState<PulseResult | null>(null);
   const [pulseCountdown, setPulseCountdown] = useState(PPG_DURATION);
   const [fingerDetected, setFingerDetected] = useState(false);
-  const [torchOn, setTorchOn] = useState(false);
+  const [torchOn, setTorchOnState] = useState(false);
   const [liveHR, setLiveHR] = useState<number | null>(null);
   const [ppgWaveform, setPpgWaveform] = useState<number[]>([]);
-  const [pulseDiag, setPulseDiag] = useState<PulseDiag | null>(null);
+  const [pulseDiag, setPulseDiagState] = useState<PulseDiag | null>(null);
+  // Mirrors of the above so useCallback([]) closures (stopPPG etc.) can read
+  // the live value instead of the stale one captured at first render.
+  const torchOnRef = useRef(false);
+  const pulseDiagRef = useRef<PulseDiag | null>(null);
+  const setTorchOn = useCallback((v: boolean) => { torchOnRef.current = v; setTorchOnState(v); }, []);
+  const setPulseDiag = useCallback((updater: PulseDiag | null | ((d: PulseDiag | null) => PulseDiag | null)) => {
+    setPulseDiagState(prev => {
+      const next = typeof updater === "function" ? (updater as (d: PulseDiag | null) => PulseDiag | null)(prev) : updater;
+      pulseDiagRef.current = next;
+      return next;
+    });
+  }, []);
 
   // Sound state
   const [soundState, setSoundState] = useState<SoundState>("idle");
@@ -728,7 +758,10 @@ export default function Home() {
 
     setPulseState("processing");
     const vals = ppgValsRef.current, times = ppgTimesRef.current;
+    const d = pulseDiagRef.current;
+    const diagTail = d ? `torch:${d.torchCapable ? (torchOnRef.current ? "on" : "off") : "n/a"} explock:${d.exposureLockState} R:${d.r} G:${d.g} B:${d.b} fps:${d.fps.toFixed(1)} amp:${d.ampPP.toFixed(1)}` : "no diag captured";
     if (vals.length < 60) {
+      pushDiagLog(`PULSE FAIL: not enough frames (${vals.length}) | ${diagTail}`);
       setError("Not enough data. Keep your finger over the camera for the full reading.");
       setPulseState("idle");
       return;
@@ -736,13 +769,16 @@ export default function Home() {
     try {
       const result = analyzePPG(vals, times);
       if (result.hr < 35 || result.hr > 210 || result.quality < 0.08) {
+        pushDiagLog(`PULSE FAIL: hr=${result.hr} quality=${result.quality.toFixed(2)} | ${diagTail}`);
         setError("Couldn't detect a clean pulse. Cover the rear camera + flash fully with your fingertip, hold still, and try again.");
         setPulseState("idle");
         return;
       }
+      pushDiagLog(`PULSE OK: hr=${result.hr} hrv=${result.hrv} quality=${result.quality.toFixed(2)} | ${diagTail}`);
       setPulseResult(result);
       setPulseState("done");
-    } catch {
+    } catch (e) {
+      pushDiagLog(`PULSE ERROR: ${e instanceof Error ? e.message : String(e)} | ${diagTail}`);
       setError("Analysis failed. Try again.");
       setPulseState("idle");
     }
@@ -886,7 +922,9 @@ export default function Home() {
       }
 
       if (windowScores.length === 0) {
-        setSoundDebug(`${debugBase}, ${totalWindows} windows all below silence threshold (rms<0.0005) — mic likely picked up almost nothing`);
+        const msg = `${debugBase}, ${totalWindows} windows all below silence threshold (rms<0.0005) - mic likely picked up almost nothing`;
+        setSoundDebug(msg);
+        pushDiagLog(`SOUND FAIL: ${msg}`);
         setError("No usable audio detected. Record again in a quiet room with the mic pressed to your chest.");
         setSoundState("idle");
         return;
@@ -934,14 +972,34 @@ export default function Home() {
         segmentsAnalyzed: segmentResults.length,
         quality: bestQuality,
       });
-      setSoundDebug(`${debugBase}, ${windowScores.length}/${totalWindows} windows usable, best window rms ${(bestWindows[0]?.rms * 100 || 0).toFixed(2)}%`);
+      const okMsg = `${debugBase}, ${windowScores.length}/${totalWindows} windows usable, best window rms ${(bestWindows[0]?.rms * 100 || 0).toFixed(2)}%`;
+      setSoundDebug(okMsg);
+      pushDiagLog(`SOUND OK: label=${avgAbnormal > avgNormal ? "abnormal" : "normal"} conf=${Math.max(avgNormal, avgAbnormal).toFixed(2)} | ${okMsg}`);
       setSoundState("done");
     } catch (e) {
       console.error(e);
-      setSoundDebug(prev => prev ?? "Recording failed to decode — check microphone permission and try again.");
+      const msg = "Recording failed to decode - check microphone permission and try again.";
+      setSoundDebug(prev => prev ?? msg);
+      pushDiagLog(`SOUND ERROR: ${e instanceof Error ? e.message : String(e)}`);
       setError("Audio processing failed.");
       setSoundState("idle");
     }
+  }, []);
+
+  // ============ DIAGNOSTICS COPY ============
+  const [copyStatus, setCopyStatus] = useState<"idle" | "copied" | "failed">("idle");
+  const [diagCount, setDiagCount] = useState(0);
+  useEffect(() => { setDiagCount(readDiagLog().length); }, [pulseState, soundState]);
+  const copyDiagnostics = useCallback(async () => {
+    const lines = readDiagLog();
+    const text = lines.length > 0 ? lines.join("\n") : "No attempts logged yet.";
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopyStatus("copied");
+    } catch {
+      setCopyStatus("failed");
+    }
+    setTimeout(() => setCopyStatus("idle"), 2500);
   }, []);
 
   // ============ RENDER ============
@@ -954,11 +1012,17 @@ export default function Home() {
         <p className="text-slate-400 text-xs mt-0.5">Heart screening &mdash; not a medical diagnosis</p>
       </div>
 
-      <div className="w-full max-w-sm flex gap-1 bg-slate-800/80 p-1 rounded-xl mb-3">
+      <div className="w-full max-w-sm flex gap-1 bg-slate-800/80 p-1 rounded-xl mb-2">
         <button className={tabClass("pulse")} onClick={() => setTab("pulse")}>Pulse</button>
         <button className={tabClass("sound")} onClick={() => setTab("sound")}>Heart Sound</button>
         <button className={tabClass("report")} onClick={() => setTab("report")}>Report</button>
       </div>
+
+      {diagCount > 0 && (
+        <button onClick={copyDiagnostics} className="w-full max-w-sm mb-3 py-1.5 px-3 bg-slate-800/60 hover:bg-slate-700/60 border border-slate-700/50 rounded-lg text-[11px] text-slate-400 flex items-center justify-center gap-1.5 transition-colors">
+          {copyStatus === "copied" ? "Copied! Paste it in the chat." : copyStatus === "failed" ? "Copy failed - long-press to select instead" : `Copy diagnostics from last ${diagCount} attempt${diagCount === 1 ? "" : "s"}`}
+        </button>
+      )}
 
       <div className="w-full max-w-sm bg-slate-800/50 rounded-2xl border border-slate-700 p-4 backdrop-blur">
 
