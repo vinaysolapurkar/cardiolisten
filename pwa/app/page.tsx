@@ -7,7 +7,9 @@ import * as tf from "@tensorflow/tfjs";
 // Audio / model (MUST match train_model.py + librosa defaults)
 const SAMPLE_RATE = 2000;      // model was trained on librosa.load(sr=2000)
 const SEGMENT_DURATION = 3;    // seconds
-const RECORD_DURATION = 30;    // seconds of chest recording
+const CHECK_DURATION = 10;     // seconds to check each chest zone
+const EXTEND_DURATION = 15;    // additional seconds recorded after a zone passes (25s total at that zone)
+const GATE_PASS_THRESHOLD = 0.5; // scoreAudioWindow threshold for "clean enough to use" (see design spec)
 const N_MFCC = 20;
 const HOP_LENGTH = 128;
 const N_FFT = 2048;            // librosa.feature.mfcc default n_fft
@@ -21,7 +23,14 @@ const WAVEFORM_POINTS = 300;
 
 type Tab = "pulse" | "sound" | "report";
 type PulseState = "idle" | "measuring" | "processing" | "done";
-type SoundState = "idle" | "recording" | "processing" | "done";
+type SoundState = "idle" | "positioning" | "checking" | "recording" | "processing" | "done" | "all_zones_failed";
+type ChestZone = "lower_left" | "upper_left" | "center";
+const ZONE_ORDER: ChestZone[] = ["lower_left", "upper_left", "center"];
+const ZONE_INFO: Record<ChestZone, { title: string; instruction: string }> = {
+  lower_left: { title: "Lower-left chest", instruction: "Place the mic on your lower-left chest, near your ribs. This spot is usually clearest." },
+  upper_left: { title: "Upper-left chest", instruction: "Place the mic on your upper-left chest, just below your collarbone." },
+  center: { title: "Center chest", instruction: "Place the mic on the center of your chest, over your lower breastbone." },
+};
 
 interface PulseResult {
   hr: number;
@@ -606,10 +615,17 @@ export default function Home() {
   // Sound state
   const [soundState, setSoundState] = useState<SoundState>("idle");
   const [soundResult, setSoundResult] = useState<SoundResult | null>(null);
-  const [soundCountdown, setSoundCountdown] = useState(RECORD_DURATION);
+  const [soundCountdown, setSoundCountdown] = useState(EXTEND_DURATION);
+  const [checkCountdown, setCheckCountdown] = useState(CHECK_DURATION);
   const [soundWaveform, setSoundWaveform] = useState<number[]>([]);
   const [soundDiag, setSoundDiag] = useState<SoundDiag | null>(null);
   const [soundDebug, setSoundDebug] = useState<string | null>(null);
+  const [zoneMessage, setZoneMessage] = useState<string | null>(null);
+  // Mirrors zoneIndexRef (see torchOn/pulseDiag mirroring above) so
+  // useCallback([]) closures read the live zone, not the first-render one.
+  const [zoneIndex, setZoneIndexState] = useState(0);
+  const zoneIndexRef = useRef(0);
+  const setZoneIndex = useCallback((v: number) => { zoneIndexRef.current = v; setZoneIndexState(v); }, []);
 
   // Refs
   const modelRef = useRef<tf.LayersModel | null>(null);
@@ -635,6 +651,10 @@ export default function Home() {
   const soundAnimRef = useRef<number>(0);
   const soundCtxRef = useRef<AudioContext | null>(null);
   const soundLevelPeakRef = useRef(0);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const beatStateRef = useRef<BeatEnvelopeState>(initBeatEnvelopeState());
+  const zoneChunksRef = useRef<Partial<Record<ChestZone, Blob[]>>>({});
+  const zoneScoresRef = useRef<Partial<Record<ChestZone, number>>>({});
 
   // Load model
   useEffect(() => {
@@ -881,110 +901,72 @@ export default function Home() {
   }, []);
 
   // ============ SOUND LOGIC ============
-  const startSound = useCallback(async () => {
+  // ============ SOUND LOGIC (guided multi-zone flow) ============
+
+  const teardownGuidedStream = useCallback(() => {
+    if (audioStreamRef.current) { audioStreamRef.current.getTracks().forEach(t => t.stop()); audioStreamRef.current = null; }
+    if (soundCtxRef.current) { soundCtxRef.current.close(); soundCtxRef.current = null; }
+    analyserRef.current = null;
+  }, []);
+
+  const startGuidedFlow = useCallback(async () => {
     setError(null);
     setSoundResult(null);
     setSoundDiag(null);
     setSoundDebug(null);
-    audioChunksRef.current = [];
-    setSoundWaveform([]);
+    setZoneMessage(null);
+    zoneChunksRef.current = {};
+    zoneScoresRef.current = {};
     soundLevelPeakRef.current = 0;
+    setZoneIndex(0);
 
     try {
-      // Record RAW mic audio (no AGC/NS/EC) so features match the training
-      // pipeline (librosa.load at 2 kHz, no bandpass/gain).
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
       });
       audioStreamRef.current = stream;
 
-      // Analyser purely for the live waveform display
       const audioCtx = new AudioContext();
       soundCtxRef.current = audioCtx;
       const source = audioCtx.createMediaStreamSource(stream);
       const analyser = audioCtx.createAnalyser();
       analyser.fftSize = 2048;
       source.connect(analyser);
+      analyserRef.current = analyser;
 
-      const mediaRecorder = new MediaRecorder(stream, {
-        mimeType: MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm",
-      });
-      mediaRecorderRef.current = mediaRecorder;
-      mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunksRef.current.push(e.data); };
-      mediaRecorder.onstop = async () => {
-        stream.getTracks().forEach(t => t.stop());
-        await processSound();
-      };
-
-      const waveData = new Float32Array(analyser.fftSize);
-      let lastDiagUpdate = 0;
-      const updateWaveform = () => {
-        analyser.getFloatTimeDomainData(waveData);
-        const step = Math.floor(waveData.length / 50);
-        const points: number[] = [];
-        for (let i = 0; i < waveData.length; i += step) points.push(waveData[i]);
-        setSoundWaveform(prev => [...prev, ...points].slice(-WAVEFORM_POINTS * 2));
-
-        // Live mic level meter (RMS + running peak) so a too-quiet or
-        // clipping recording is visible on screen instead of discovered
-        // after the fact from a failed classification.
-        const now = performance.now();
-        if (now - lastDiagUpdate > 200) {
-          lastDiagUpdate = now;
-          let sumSq = 0, peak = 0;
-          for (let i = 0; i < waveData.length; i++) {
-            const v = waveData[i];
-            sumSq += v * v;
-            if (Math.abs(v) > peak) peak = Math.abs(v);
-          }
-          const rms = Math.sqrt(sumSq / waveData.length);
-          soundLevelPeakRef.current = Math.max(soundLevelPeakRef.current * 0.98, peak);
-          setSoundDiag({ level: rms, peak: soundLevelPeakRef.current });
-        }
-        soundAnimRef.current = requestAnimationFrame(updateWaveform);
-      };
-      updateWaveform();
-
-      mediaRecorder.start(100);
-      setSoundState("recording");
-      setSoundCountdown(RECORD_DURATION);
-
-      let remaining = RECORD_DURATION;
-      soundTimerRef.current = setInterval(() => {
-        remaining--;
-        setSoundCountdown(remaining);
-        if (remaining <= 0) stopSound();
-      }, 1000);
+      setSoundState("positioning");
     } catch {
       setError("Microphone access denied.");
       setSoundState("idle");
     }
   }, []);
 
-  const stopSound = useCallback(() => {
+  const stopGuidedFlow = useCallback(() => {
     if (soundTimerRef.current) clearInterval(soundTimerRef.current);
     cancelAnimationFrame(soundAnimRef.current);
-    if (soundCtxRef.current) { soundCtxRef.current.close(); soundCtxRef.current = null; }
-    if (mediaRecorderRef.current?.state === "recording") mediaRecorderRef.current.stop();
+    const recorder = mediaRecorderRef.current;
+    if (recorder && recorder.state === "recording") { recorder.onstop = null; recorder.stop(); }
+    teardownGuidedStream();
+    setSoundState("idle");
+    setZoneMessage(null);
   }, []);
 
-  const processSound = useCallback(async () => {
+  const analyzeZoneAudio = useCallback(async (chunks: Blob[], zone: ChestZone) => {
     setSoundState("processing");
     try {
-      const blob = new Blob(audioChunksRef.current, { type: "audio/webm" });
+      const blob = new Blob(chunks, { type: "audio/webm" });
       const arrayBuffer = await blob.arrayBuffer();
       const audioCtx = new AudioContext();
       const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
       audioCtx.close();
 
       const rawData = audioBuffer.getChannelData(0);
-      // Anti-aliased resample to the model's 2 kHz (matches librosa.load(sr=2000))
       const resampled = resampleAudio(rawData, audioBuffer.sampleRate, SAMPLE_RATE);
 
       let rawMax = 0, rawSumSq = 0;
       for (let i = 0; i < rawData.length; i++) { const a = Math.abs(rawData[i]); if (a > rawMax) rawMax = a; rawSumSq += rawData[i] * rawData[i]; }
       const rawRms = Math.sqrt(rawSumSq / rawData.length);
-      const debugBase = `recorded ${(audioBuffer.length / audioBuffer.sampleRate).toFixed(1)}s @ ${audioBuffer.sampleRate}Hz, ` +
+      const debugBase = `zone=${zone}, recorded ${(audioBuffer.length / audioBuffer.sampleRate).toFixed(1)}s @ ${audioBuffer.sampleRate}Hz, ` +
         `mic level: peak ${(rawMax * 100).toFixed(0)}% / rms ${(rawRms * 100).toFixed(1)}%`;
 
       const { windows: windowScores, totalWindows } = scoreAudioWindows(resampled, SAMPLE_RATE, SEGMENT_DURATION, SEGMENT_DURATION / 2);
@@ -993,8 +975,9 @@ export default function Home() {
         const msg = `${debugBase}, ${totalWindows} windows all below silence threshold (rms<0.0005) - mic likely picked up almost nothing`;
         setSoundDebug(msg);
         pushDiagLog(`SOUND FAIL: ${msg}`);
-        setError("No usable audio detected. Record again in a quiet room with the mic pressed to your chest.");
+        setError("No usable audio detected. Let's try the guided placement again.");
         setSoundState("idle");
+        teardownGuidedStream();
         return;
       }
 
@@ -1043,16 +1026,180 @@ export default function Home() {
       });
       const okMsg = `${debugBase}, ${windowScores.length}/${totalWindows} windows usable, best window rms ${(bestWindows[0]?.rms * 100 || 0).toFixed(2)}%`;
       setSoundDebug(okMsg);
-      pushDiagLog(`SOUND OK: label=${avgAbnormal > avgNormal ? "abnormal" : "normal"} conf=${Math.max(avgNormal, avgAbnormal).toFixed(2)} | ${okMsg}`);
+      pushDiagLog(`SOUND OK: zone=${zone} label=${avgAbnormal > avgNormal ? "abnormal" : "normal"} conf=${Math.max(avgNormal, avgAbnormal).toFixed(2)} | ${okMsg}`);
       setSoundState("done");
+      teardownGuidedStream();
     } catch (e) {
       console.error(e);
       const msg = "Recording failed to decode - check microphone permission and try again.";
       setSoundDebug(prev => prev ?? msg);
-      pushDiagLog(`SOUND ERROR: ${e instanceof Error ? e.message : String(e)}`);
+      pushDiagLog(`SOUND ERROR: zone=${zone} ${e instanceof Error ? e.message : String(e)}`);
       setError("Audio processing failed.");
       setSoundState("idle");
+      teardownGuidedStream();
     }
+  }, []);
+
+  const finalizeZoneSuccess = useCallback((zone: ChestZone) => {
+    setZoneMessage(`Detected! Recording a bit more at your ${ZONE_INFO[zone].title.toLowerCase()}...`);
+    setSoundState("recording");
+    setCheckCountdown(0);
+    setSoundCountdown(EXTEND_DURATION);
+
+    let remaining = EXTEND_DURATION;
+    soundTimerRef.current = setInterval(() => {
+      remaining--;
+      setSoundCountdown(remaining);
+      if (remaining <= 0) {
+        if (soundTimerRef.current) clearInterval(soundTimerRef.current);
+        cancelAnimationFrame(soundAnimRef.current);
+        const recorder = mediaRecorderRef.current;
+        if (recorder && recorder.state === "recording") {
+          recorder.onstop = () => { analyzeZoneAudio(audioChunksRef.current.slice(), zone); };
+          recorder.stop();
+        }
+      }
+    }, 1000);
+  }, []);
+
+  const advanceZone = useCallback(() => {
+    cancelAnimationFrame(soundAnimRef.current);
+    const recorder = mediaRecorderRef.current;
+    const nextIndex = zoneIndexRef.current + 1;
+
+    const goNext = () => {
+      if (nextIndex < ZONE_ORDER.length) {
+        setZoneMessage("Didn't get a clean signal here.");
+        setZoneIndex(nextIndex);
+        setSoundState("positioning");
+      } else {
+        setSoundState("all_zones_failed");
+      }
+    };
+
+    if (recorder && recorder.state === "recording") {
+      recorder.onstop = goNext;
+      recorder.stop();
+    } else {
+      goNext();
+    }
+  }, []);
+
+  const evaluateZoneGate = useCallback(async () => {
+    const zone = ZONE_ORDER[zoneIndexRef.current];
+    const chunksSoFar = audioChunksRef.current.slice();
+    const blob = new Blob(chunksSoFar, { type: "audio/webm" });
+
+    let score = 0;
+    try {
+      const arrayBuffer = await blob.arrayBuffer();
+      const scratchCtx = new AudioContext();
+      const audioBuffer = await scratchCtx.decodeAudioData(arrayBuffer);
+      scratchCtx.close();
+      const resampled = resampleAudio(audioBuffer.getChannelData(0), audioBuffer.sampleRate, SAMPLE_RATE);
+      score = bestWindowScore(resampled, SAMPLE_RATE, SEGMENT_DURATION, SEGMENT_DURATION / 2).score;
+    } catch {
+      score = 0;
+    }
+
+    zoneScoresRef.current[zone] = score;
+    pushDiagLog(`SOUND ZONE CHECK: zone=${zone} score=${score.toFixed(2)} ${score > GATE_PASS_THRESHOLD ? "PASS" : "FAIL"}`);
+
+    if (score > GATE_PASS_THRESHOLD) {
+      finalizeZoneSuccess(zone);
+    } else {
+      zoneChunksRef.current[zone] = chunksSoFar;
+      advanceZone();
+    }
+  }, []);
+
+  const beginZoneCheck = useCallback(() => {
+    const stream = audioStreamRef.current;
+    const analyser = analyserRef.current;
+    if (!stream || !analyser) return;
+
+    setError(null);
+    setZoneMessage(null);
+    audioChunksRef.current = [];
+    setSoundWaveform([]);
+    beatStateRef.current = initBeatEnvelopeState();
+
+    const mediaRecorder = new MediaRecorder(stream, {
+      mimeType: MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" : "audio/webm",
+    });
+    mediaRecorderRef.current = mediaRecorder;
+    mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunksRef.current.push(e.data); };
+    mediaRecorder.start(100);
+
+    const waveData = new Float32Array(analyser.fftSize);
+    let lastDiagUpdate = 0;
+    const FRESH_TAIL = 512; // most-recent samples of the buffer only, avoids reprocessing the same audio every frame
+    const updateLive = () => {
+      analyser.getFloatTimeDomainData(waveData);
+
+      const now = performance.now();
+      if (now - lastDiagUpdate > 200) {
+        lastDiagUpdate = now;
+        let sumSq = 0, peak = 0;
+        for (let i = 0; i < waveData.length; i++) {
+          const v = waveData[i];
+          sumSq += v * v;
+          if (Math.abs(v) > peak) peak = Math.abs(v);
+        }
+        const rms = Math.sqrt(sumSq / waveData.length);
+        soundLevelPeakRef.current = Math.max(soundLevelPeakRef.current * 0.98, peak);
+        setSoundDiag({ level: rms, peak: soundLevelPeakRef.current });
+      }
+
+      let tailPeak = 0;
+      for (let i = waveData.length - FRESH_TAIL; i < waveData.length; i++) {
+        const a = Math.abs(waveData[i]);
+        if (a > tailPeak) tailPeak = a;
+      }
+      const { state, beatDetected } = processBeatEnvelopeSample(beatStateRef.current, tailPeak, now);
+      beatStateRef.current = state;
+      setSoundWaveform(prev => [...prev, beatDetected ? 1 : 0].slice(-WAVEFORM_POINTS));
+
+      soundAnimRef.current = requestAnimationFrame(updateLive);
+    };
+    updateLive();
+
+    setSoundState("checking");
+    setCheckCountdown(CHECK_DURATION);
+    let remaining = CHECK_DURATION;
+    soundTimerRef.current = setInterval(() => {
+      remaining--;
+      setCheckCountdown(remaining);
+      if (remaining <= 0) {
+        if (soundTimerRef.current) clearInterval(soundTimerRef.current);
+        evaluateZoneGate();
+      }
+    }, 1000);
+  }, []);
+
+  const useBestZoneAnyway = useCallback(() => {
+    const scores = zoneScoresRef.current;
+    let bestZone: ChestZone | null = null, bestScore = -1;
+    for (const z of ZONE_ORDER) {
+      const s = scores[z] ?? -1;
+      if (s > bestScore) { bestScore = s; bestZone = z; }
+    }
+    const chunks = bestZone ? zoneChunksRef.current[bestZone] : undefined;
+    if (!bestZone || !chunks) {
+      setError("No recording available. Please try again.");
+      setSoundState("idle");
+      teardownGuidedStream();
+      return;
+    }
+    analyzeZoneAudio(chunks, bestZone);
+  }, []);
+
+  const retryGuidedFlow = useCallback(() => {
+    zoneChunksRef.current = {};
+    zoneScoresRef.current = {};
+    setZoneIndex(0);
+    setZoneMessage(null);
+    setSoundState("positioning");
   }, []);
 
   // ============ DIAGNOSTICS COPY ============
