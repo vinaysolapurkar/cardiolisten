@@ -9,7 +9,11 @@ const SAMPLE_RATE = 2000;      // model was trained on librosa.load(sr=2000)
 const SEGMENT_DURATION = 3;    // seconds
 const CHECK_DURATION = 10;     // seconds to check each chest zone
 const EXTEND_DURATION = 15;    // additional seconds recorded after a zone passes (25s total at that zone)
-const GATE_PASS_THRESHOLD = 0.5; // scoreAudioWindow threshold for "clean enough to use" (see design spec)
+// Lowered from 0.5 to 0.18 after real-device testing (Pixel 6 Pro, 2026-07-18)
+// showed genuine, model-usable recordings scoring ~0.23 -- the original 0.5
+// was set without real calibration data and rejected every real attempt.
+// See verify/window_score.mjs for the calibration against real device logs.
+const GATE_PASS_THRESHOLD = 0.18; // scoreAudioWindow threshold for "clean enough to use"
 const N_MFCC = 20;
 const HOP_LENGTH = 128;
 const N_FFT = 2048;            // librosa.feature.mfcc default n_fft
@@ -314,7 +318,15 @@ function scoreAudioWindow(segment: Float32Array | Float64Array): WindowScore {
   const variance = chunkEnergies.reduce((s, e) => s + (e - meanEnergy) ** 2, 0) / chunkEnergies.length;
   const cv = Math.sqrt(variance) / (meanEnergy + 1e-10);
 
-  const rmsScore = rms > 0.001 && rms < 0.5 ? 1 : 0.3;
+  // rms >= 0.0005 already guaranteed by the early return above (the real
+  // silence floor) -- only cap the UPPER end (clipping/too-loud). A second,
+  // higher lower-bound here double-penalizes legitimately quiet recordings:
+  // real phone-mic heart sounds average very low RMS over a 3s window since
+  // most of the window is silence between S1/S2 beats. Confirmed against a
+  // real device log (Pixel 6 Pro): a recording the model classified with 73%
+  // confidence had best-window rms of only 0.06%, well below the old 0.1%
+  // floor. See verify/window_score.mjs for the calibration.
+  const rmsScore = rms < 0.5 ? 1 : 0.15;
   const cvScore = Math.max(0, 1 - cv * 2);
   return { score: rmsScore * cvScore, rms };
 }

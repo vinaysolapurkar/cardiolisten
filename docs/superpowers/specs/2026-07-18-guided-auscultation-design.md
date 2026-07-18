@@ -93,23 +93,39 @@ capture-UX layer in front of the existing, tested inference code.
 ## Pass/fail gate (per zone, at the 10s mark)
 
 Reuse the existing, already-verified window quality heuristic from
-`processSound` — RMS in a sane range (not near-silence, not clipping) combined
-with low coefficient-of-variation of chunk energies (a proxy for "consistent,
-rhythmic energy" vs. noise) — rather than building a new detection algorithm.
+`processSound` — RMS in a sane range (not clipping) combined with low
+coefficient-of-variation of chunk energies (a proxy for "consistent energy"
+vs. erratic handling noise) — rather than building a new detection algorithm.
 Concretely: run the same scoring computation the current code already applies
 to candidate 3-second windows (`score = rmsScore * cvScore`, where
-`rmsScore` is `1` if `0.001 < rms < 0.5` else `0.3`, and
-`cvScore = max(0, 1 - cv * 2)`), applied here to 3-second sub-windows within
-the zone's 10s check clip (at 50% hop, giving ~5 sub-windows); take the best
-sub-window's score.
+`rmsScore` is `1` if `rms < 0.5` else `0.15`, and `cvScore = max(0, 1 - cv *
+2)`), applied here to 3-second sub-windows within the zone's 10s check clip
+(at 50% hop, giving ~5 sub-windows); take the best sub-window's score.
 
-**Pass threshold: `score > 0.5`.** This requires `rmsScore == 1` (RMS in the
-non-silent, non-clipping range) *and* `cvScore > 0.5` (`cv < 0.25`, i.e.
-energy across the 10 sub-chunks of that window is reasonably consistent —
-more rhythmic than noisy). This is a concrete, testable number (see Testing
-below), not a relative "best of the 3 zones" comparison — a zone can fail
-outright even if it's the best of a bad set, which is what drives the
-"all 3 zones failed" path.
+**Pass threshold: `score > 0.18`.**
+
+*Revised 2026-07-18 after real-device testing (Pixel 6 Pro).* The original
+design called for `score > 0.5`, requiring `rmsScore == 1` with a lower bound
+of `rms > 0.001` — but real testing showed every attempt failing the gate,
+including recordings the model itself classified with high confidence via the
+"use best zone anyway" fallback. Root cause: real phone-mic heart sounds
+average very low RMS over a 3-second window (most of the window is silence
+between S1/S2 beats), and the original `0.001` lower bound was redundant with
+— and stricter than — the function's own separate silence filter
+(`rms < 0.0005` returns `score: 0` before the RMS bucket is even evaluated).
+That redundant floor was rejecting genuine, usable recordings. It's removed;
+`rmsScore` now only caps the *upper* end (clipping). The clipping penalty was
+also tightened (`0.3` → `0.15`) to keep clear separation from genuine
+quiet-but-real recordings, which calibrated to a score of ~0.23 against real
+device data (see `verify/window_score.mjs`'s "quiet-but-rhythmic" case,
+built directly from a real captured device log). `0.18` sits below that with
+a margin, and above the `0.15` clipping ceiling.
+
+This remains a concrete, testable number (see Testing below), not a relative
+"best of the 3 zones" comparison — a zone can still fail outright even if
+it's the best of a bad set, which is what drives the "all 3 zones failed"
+path; the threshold is just recalibrated to real-world signal levels rather
+than an unvalidated guess.
 
 This is a deliberate low-risk choice: no new algorithm surface, reuses logic
 that's already running in production today.
