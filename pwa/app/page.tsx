@@ -583,6 +583,36 @@ function LiveWaveform({ data, color, height = 80 }: { data: number[]; color: str
   );
 }
 
+// ============ Zone Map Component ============
+// Abstract zone grid (approved over a body-silhouette illustration in
+// brainstorming). Fixed visual layout — top-left, bottom-left, bottom-right —
+// independent of attempt order; the active zone is highlighted regardless of
+// where it sits in this fixed layout.
+
+function ZoneMap({ activeZone }: { activeZone: ChestZone }) {
+  const box = (zone: ChestZone, x: number, y: number, w: number, h: number) => {
+    const active = zone === activeZone;
+    return (
+      <rect
+        x={x} y={y} width={w} height={h} rx={12}
+        fill={active ? "#3b82f6" : "#1e293b"}
+        stroke={active ? "#60a5fa" : "#334155"}
+        strokeWidth={active ? 2.5 : 1.5}
+        opacity={active ? 0.9 : 0.6}
+      />
+    );
+  };
+  return (
+    <svg viewBox="0 0 200 220" width="100%" height="180" className="bg-slate-900/50 rounded-xl">
+      <rect x="30" y="20" width="140" height="180" rx="24" fill="none" stroke="#475569" strokeWidth="2" />
+      <line x1="100" y1="20" x2="100" y2="200" stroke="#334155" strokeWidth="1" strokeDasharray="4 4" />
+      {box("upper_left", 42, 35, 52, 52)}
+      {box("lower_left", 42, 140, 52, 45)}
+      {box("center", 106, 140, 52, 45)}
+    </svg>
+  );
+}
+
 // ============ MAIN COMPONENT ============
 
 export default function Home() {
@@ -1376,12 +1406,67 @@ export default function Home() {
                 </div>
                 <div className="text-center">
                   <p className="text-slate-300 text-sm font-medium">Heart Sound Screening</p>
-                  <p className="text-slate-500 text-xs mt-1">Press the phone mic firmly on your bare left chest in a quiet room.</p>
+                  <p className="text-slate-500 text-xs mt-1">We'll guide you to a few spots on your bare chest and check each one for a clear signal, in a quiet room.</p>
                   <p className="text-amber-400/80 text-[11px] mt-1">Experimental. A phone mic is not a stethoscope &mdash; treat results as a rough screen only.</p>
                 </div>
                 {!modelLoaded && <p className="text-yellow-400 text-xs animate-pulse">Loading AI model...</p>}
-                <button onClick={startSound} disabled={!modelLoaded} className="w-full py-3 bg-blue-500 hover:bg-blue-600 disabled:bg-slate-600 rounded-xl font-semibold transition-colors">
-                  Start Recording
+                <button onClick={startGuidedFlow} disabled={!modelLoaded} className="w-full py-3 bg-blue-500 hover:bg-blue-600 disabled:bg-slate-600 rounded-xl font-semibold transition-colors">
+                  Start Guided Check
+                </button>
+              </div>
+            )}
+
+            {soundState === "positioning" && (
+              <div className="flex flex-col items-center gap-4">
+                <ZoneMap activeZone={ZONE_ORDER[zoneIndex]} />
+                <div className="text-center">
+                  <p className="text-slate-300 text-sm font-medium">{ZONE_INFO[ZONE_ORDER[zoneIndex]].title}</p>
+                  <p className="text-slate-500 text-xs mt-1">{ZONE_INFO[ZONE_ORDER[zoneIndex]].instruction}</p>
+                  {zoneMessage && <p className="text-amber-400/80 text-xs mt-2">{zoneMessage}</p>}
+                </div>
+                <button onClick={beginZoneCheck} className="w-full py-3 bg-blue-500 hover:bg-blue-600 rounded-xl font-semibold transition-colors">
+                  I'm in position
+                </button>
+                <button onClick={stopGuidedFlow} className="text-slate-500 text-xs underline">
+                  Cancel
+                </button>
+              </div>
+            )}
+
+            {soundState === "checking" && (
+              <div className="flex flex-col gap-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-blue-400 font-medium text-sm animate-pulse">Checking {ZONE_INFO[ZONE_ORDER[zoneIndex]].title.toLowerCase()}</p>
+                    <p className="text-slate-500 text-xs">Hold still, keep the room quiet</p>
+                  </div>
+                  <div className="w-12 h-12 rounded-full bg-blue-500 flex items-center justify-center flex-shrink-0">
+                    <span className="text-lg font-bold">{checkCountdown}</span>
+                  </div>
+                </div>
+
+                <LiveWaveform data={soundWaveform} color="#3b82f6" height={140} />
+
+                {soundDiag && (
+                  <div className="bg-slate-900/60 rounded-lg p-2 border border-slate-700/50">
+                    <div className="flex justify-between text-[10px] text-slate-400 mb-1">
+                      <span>mic level</span>
+                      <span className={soundDiag.peak > 0.9 ? "text-red-400" : soundDiag.peak < 0.02 ? "text-amber-400" : "text-green-400"}>
+                        {soundDiag.peak > 0.9 ? "clipping ✗" : soundDiag.peak < 0.02 ? "too quiet ✗" : "OK ✓"} (peak {(soundDiag.peak * 100).toFixed(0)}%)
+                      </span>
+                    </div>
+                    <div className="h-1.5 bg-slate-700 rounded-full overflow-hidden">
+                      <div className={`h-full rounded-full transition-all ${soundDiag.peak > 0.9 ? "bg-red-500" : "bg-blue-500"}`} style={{ width: `${Math.min(100, soundDiag.peak * 100)}%` }} />
+                    </div>
+                  </div>
+                )}
+
+                <div className="w-full bg-slate-700 rounded-full h-1">
+                  <div className="bg-blue-500 h-1 rounded-full transition-all" style={{ width: `${((CHECK_DURATION - checkCountdown) / CHECK_DURATION) * 100}%` }} />
+                </div>
+
+                <button onClick={stopGuidedFlow} className="text-slate-500 text-xs underline self-center">
+                  Cancel
                 </button>
               </div>
             )}
@@ -1390,7 +1475,7 @@ export default function Home() {
               <div className="flex flex-col gap-3">
                 <div className="flex items-center justify-between">
                   <div>
-                    <p className="text-blue-400 font-medium text-sm animate-pulse">Recording Heart Sound</p>
+                    <p className="text-blue-400 font-medium text-sm animate-pulse">{zoneMessage ?? "Great signal! Recording a bit more..."}</p>
                     <p className="text-slate-500 text-xs">Hold still, keep the room quiet</p>
                   </div>
                   <div className="w-12 h-12 rounded-full bg-blue-500 flex items-center justify-center flex-shrink-0">
@@ -1415,11 +1500,11 @@ export default function Home() {
                 )}
 
                 <div className="w-full bg-slate-700 rounded-full h-1">
-                  <div className="bg-blue-500 h-1 rounded-full transition-all" style={{ width: `${((RECORD_DURATION - soundCountdown) / RECORD_DURATION) * 100}%` }} />
+                  <div className="bg-blue-500 h-1 rounded-full transition-all" style={{ width: `${((EXTEND_DURATION - soundCountdown) / EXTEND_DURATION) * 100}%` }} />
                 </div>
 
-                <button onClick={() => stopSound()} className="w-full py-2 bg-slate-700 hover:bg-slate-600 rounded-xl text-sm font-medium transition-colors">
-                  Stop &amp; Analyze
+                <button onClick={stopGuidedFlow} className="text-slate-500 text-xs underline self-center">
+                  Cancel
                 </button>
               </div>
             )}
@@ -1461,7 +1546,7 @@ export default function Home() {
                   </div>
                 </div>
                 <p className="text-slate-500 text-[11px] text-center">This is a screening estimate, not a diagnosis. Any concern &mdash; see a clinician.</p>
-                <button onClick={() => { setSoundState("idle"); setSoundResult(null); setSoundWaveform([]); }} className="w-full py-2 bg-slate-700 hover:bg-slate-600 rounded-xl text-sm font-medium transition-colors">
+                <button onClick={() => { setSoundState("idle"); setSoundResult(null); setSoundWaveform([]); setZoneIndex(0); zoneChunksRef.current = {}; zoneScoresRef.current = {}; }} className="w-full py-2 bg-slate-700 hover:bg-slate-600 rounded-xl text-sm font-medium transition-colors">
                   Record Again
                 </button>
               </div>
