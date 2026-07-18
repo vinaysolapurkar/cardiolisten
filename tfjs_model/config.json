@@ -1,0 +1,11 @@
+{
+  "sampleRate": 2000,
+  "segmentDuration": 3,
+  "nMfcc": 20,
+  "hopLength": 128,
+  "maxFrames": 47,
+  "classes": [
+    "normal",
+    "abnormal"
+  ]
+}
