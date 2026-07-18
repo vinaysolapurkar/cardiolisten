@@ -685,6 +685,11 @@ export default function Home() {
   const beatStateRef = useRef<BeatEnvelopeState>(initBeatEnvelopeState());
   const zoneChunksRef = useRef<Partial<Record<ChestZone, Blob[]>>>({});
   const zoneScoresRef = useRef<Partial<Record<ChestZone, number>>>({});
+  // Bumped whenever a guided-flow session starts or is cancelled, so async work
+  // (evaluateZoneGate, analyzeZoneAudio) that resumes after an `await` can tell
+  // it belongs to a stale session and bail out instead of driving state that no
+  // longer applies (see stopGuidedFlow / startGuidedFlow).
+  const guidedFlowEpochRef = useRef(0);
 
   // Load model
   useEffect(() => {
@@ -940,6 +945,10 @@ export default function Home() {
   }, []);
 
   const startGuidedFlow = useCallback(async () => {
+    // New session: anything still in flight from a prior session (e.g. a
+    // cancelled evaluateZoneGate/analyzeZoneAudio whose await just resolved)
+    // is now stale and must not be allowed to drive this fresh session's state.
+    guidedFlowEpochRef.current += 1;
     setError(null);
     setSoundResult(null);
     setSoundDiag(null);
@@ -972,6 +981,10 @@ export default function Home() {
   }, []);
 
   const stopGuidedFlow = useCallback(() => {
+    // Invalidate any evaluateZoneGate/analyzeZoneAudio still awaiting in the
+    // background so its eventual resolution becomes a no-op instead of
+    // resurrecting state after this cancel.
+    guidedFlowEpochRef.current += 1;
     if (soundTimerRef.current) clearInterval(soundTimerRef.current);
     cancelAnimationFrame(soundAnimRef.current);
     const recorder = mediaRecorderRef.current;
@@ -981,7 +994,14 @@ export default function Home() {
     setZoneMessage(null);
   }, []);
 
-  const analyzeZoneAudio = useCallback(async (chunks: Blob[], zone: ChestZone) => {
+  const analyzeZoneAudio = useCallback(async (chunks: Blob[], zone: ChestZone, epoch: number) => {
+    // Guard against a stale call: this can be scheduled by a MediaRecorder
+    // "onstop" handler (see finalizeZoneSuccess) that was armed before the
+    // user cancelled, and the recorder's `state` flips to "inactive"
+    // synchronously inside stop() — before the async stop event that runs the
+    // handler — so stopGuidedFlow's `state === "recording"` check can race and
+    // miss clearing it. Bail out before touching any state if that happened.
+    if (epoch !== guidedFlowEpochRef.current) return;
     setSoundState("processing");
     try {
       const blob = new Blob(chunks, { type: "audio/webm" });
@@ -989,6 +1009,7 @@ export default function Home() {
       const audioCtx = new AudioContext();
       const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
       audioCtx.close();
+      if (epoch !== guidedFlowEpochRef.current) return;
 
       const rawData = audioBuffer.getChannelData(0);
       const resampled = resampleAudio(rawData, audioBuffer.sampleRate, SAMPLE_RATE);
@@ -1035,6 +1056,7 @@ export default function Home() {
         prediction.dispose();
         segmentResults.push({ normal: probs[0], abnormal: probs[1], score: win.score });
       }
+      if (epoch !== guidedFlowEpochRef.current) return;
 
       let totalWeight = 0, wNormal = 0, wAbnormal = 0;
       for (const r of segmentResults) {
@@ -1060,6 +1082,7 @@ export default function Home() {
       setSoundState("done");
       teardownGuidedStream();
     } catch (e) {
+      if (epoch !== guidedFlowEpochRef.current) return;
       console.error(e);
       const msg = "Recording failed to decode - check microphone permission and try again.";
       setSoundDebug(prev => prev ?? msg);
@@ -1085,7 +1108,13 @@ export default function Home() {
         cancelAnimationFrame(soundAnimRef.current);
         const recorder = mediaRecorderRef.current;
         if (recorder && recorder.state === "recording") {
-          recorder.onstop = () => { analyzeZoneAudio(audioChunksRef.current.slice(), zone); };
+          // Capture the epoch right before stop(): recorder.state flips to
+          // "inactive" synchronously inside stop(), so a cancel that lands in
+          // the gap before the async "stop" event fires won't be caught by
+          // stopGuidedFlow's `state === "recording"` check. analyzeZoneAudio
+          // re-checks this epoch once its own awaits resolve.
+          const epoch = guidedFlowEpochRef.current;
+          recorder.onstop = () => { analyzeZoneAudio(audioChunksRef.current.slice(), zone, epoch); };
           recorder.stop();
         }
       }
@@ -1096,8 +1125,13 @@ export default function Home() {
     cancelAnimationFrame(soundAnimRef.current);
     const recorder = mediaRecorderRef.current;
     const nextIndex = zoneIndexRef.current + 1;
+    // Same recorder.stop()-vs-cancel race as finalizeZoneSuccess/analyzeZoneAudio:
+    // capture the epoch now, since when goNext runs via the async "stop" event
+    // it may be after this session was cancelled.
+    const epoch = guidedFlowEpochRef.current;
 
     const goNext = () => {
+      if (epoch !== guidedFlowEpochRef.current) return;
       if (nextIndex < ZONE_ORDER.length) {
         setZoneMessage("Didn't get a clean signal here.");
         setZoneIndex(nextIndex);
@@ -1116,6 +1150,12 @@ export default function Home() {
   }, []);
 
   const evaluateZoneGate = useCallback(async () => {
+    // Capture the session epoch before the await below. If the guided flow is
+    // cancelled or restarted while decodeAudioData is in flight, stopGuidedFlow
+    // / startGuidedFlow bump guidedFlowEpochRef, and the checks after the
+    // await let this stale evaluation bail out instead of calling
+    // finalizeZoneSuccess/advanceZone and resurrecting torn-down UI state.
+    const epoch = guidedFlowEpochRef.current;
     const zone = ZONE_ORDER[zoneIndexRef.current];
     const chunksSoFar = audioChunksRef.current.slice();
     const blob = new Blob(chunksSoFar, { type: "audio/webm" });
@@ -1126,11 +1166,26 @@ export default function Home() {
       const scratchCtx = new AudioContext();
       const audioBuffer = await scratchCtx.decodeAudioData(arrayBuffer);
       scratchCtx.close();
+      if (epoch !== guidedFlowEpochRef.current) return;
       const resampled = resampleAudio(audioBuffer.getChannelData(0), audioBuffer.sampleRate, SAMPLE_RATE);
       score = bestWindowScore(resampled, SAMPLE_RATE, SEGMENT_DURATION, SEGMENT_DURATION / 2).score;
-    } catch {
+    } catch (e) {
+      if (epoch !== guidedFlowEpochRef.current) return;
+      // Decode failure is NOT the same thing as genuine silence (score=0 from
+      // the try path) - log it distinctly so a real-device decode issue is
+      // diagnosable and not confused with "the recorder just heard nothing".
+      // Still counts as a FAIL for gating purposes (score stays 0), so it
+      // falls into the same advanceZone() outcome as before - but through an
+      // early return so exactly one diagnostic line is emitted per attempt.
       score = 0;
+      zoneScoresRef.current[zone] = score;
+      pushDiagLog(`SOUND ZONE CHECK: zone=${zone} DECODE_ERROR ${e instanceof Error ? e.message : String(e)}`);
+      zoneChunksRef.current[zone] = chunksSoFar;
+      advanceZone();
+      return;
     }
+
+    if (epoch !== guidedFlowEpochRef.current) return;
 
     zoneScoresRef.current[zone] = score;
     pushDiagLog(`SOUND ZONE CHECK: zone=${zone} score=${score.toFixed(2)} ${score > GATE_PASS_THRESHOLD ? "PASS" : "FAIL"}`);
@@ -1221,7 +1276,7 @@ export default function Home() {
       teardownGuidedStream();
       return;
     }
-    analyzeZoneAudio(chunks, bestZone);
+    analyzeZoneAudio(chunks, bestZone, guidedFlowEpochRef.current);
   }, []);
 
   const retryGuidedFlow = useCallback(() => {
