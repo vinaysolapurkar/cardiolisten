@@ -7,3 +7,4 @@ tfjs_model/heart_model.keras
 tfjs_model/mfcc_mean.npy
 tfjs_model/mfcc_std.npy
 data/
+verify/ref.json
