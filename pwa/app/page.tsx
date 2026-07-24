@@ -578,8 +578,10 @@ function cascadedSELMS(audio: Float32Array, filterLength: number = 32, delay: nu
 
 // Full noise reduction pipeline: bandpass → spectral subtraction → Cascaded SE-LMS
 function cleanHeartSound(audio: Float32Array, sr: number): { cleaned: Float32Array; snrImprovement: number } {
-  // Step 1: 4th order Butterworth bandpass 25-400Hz
-  const bandpassed = butterworthBandpass(audio, sr, 25, 400);
+  // Step 1: 4th order Butterworth bandpass 20-200Hz (S1/S2 heart-sound band).
+  // Narrower than the old 25-400Hz: cutting 200-400Hz removes a lot of room/rustle
+  // noise while keeping the fundamental heart sounds, which improves SNR on phone mics.
+  const bandpassed = butterworthBandpass(audio, sr, 20, 200);
 
   // Step 2: Spectral subtraction to remove stationary noise
   const specSub = spectralSubtraction(bandpassed, sr, 256);
@@ -1010,6 +1012,13 @@ export default function Home() {
   const [soundResult, setSoundResult] = useState<SoundResult | null>(null);
   const [soundCountdown, setSoundCountdown] = useState(RECORD_DURATION);
   const [soundWaveform, setSoundWaveform] = useState<number[]>([]);
+  // Live mic sensitivity (user-adjustable while placing the phone) + live beat feedback.
+  // A blind fixed gain just amplifies the noise floor ("radio static"); letting the user
+  // tune it against a live heart-band meter is how the working apps (Echoes) hit ~80%.
+  const [micGain, setMicGain] = useState(12);
+  const [beatLevel, setBeatLevel] = useState(0); // 0-1, live heart-band energy
+  const [liveBeatBpm, setLiveBeatBpm] = useState<number | null>(null);
+  const [beatPulse, setBeatPulse] = useState(0); // increments each detected beat (drives ♥ animation)
 
   // Refs
   const modelRef = useRef<tf.LayersModel | null>(null);
@@ -1023,6 +1032,8 @@ export default function Home() {
   const ppgStreamRef = useRef<MediaStream | null>(null);
   const pcmBufferRef = useRef<Float32Array[]>([]);
   const scriptNodeRef = useRef<ScriptProcessorNode | null>(null);
+  const gainNodeRef = useRef<GainNode | null>(null); // live-adjustable capture gain
+  const beatEnvRef = useRef<{ baseline: number; lastBeatT: number; beatTimes: number[] }>({ baseline: 0, lastBeatT: 0, beatTimes: [] });
   const soundTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const soundAnimRef = useRef<number>(0);
   const soundCtxRef = useRef<AudioContext | null>(null);
@@ -1185,45 +1196,83 @@ export default function Home() {
       nativeSampleRateRef.current = audioCtx.sampleRate; // Store actual rate (48000 on most phones)
       const source = audioCtx.createMediaStreamSource(stream);
 
-      // High gain (10x) — heart sounds through chest wall are very faint
-      const gainNode = audioCtx.createGain();
-      gainNode.gain.value = 10;
-
-      // NO bandpass filter before recording — capture full spectrum raw audio
-      // All filtering happens offline in processSound for maximum signal preservation
-      source.connect(gainNode);
-
-      // Analyser for live waveform display
-      const analyser = audioCtx.createAnalyser();
-      analyser.fftSize = 2048;
-      gainNode.connect(analyser);
-
-      // ScriptProcessorNode to capture raw PCM samples (Float32Array)
-      // This bypasses MediaRecorder entirely — no WebM container, no Opus codec
+      // CAPTURE branch: raw, ungained PCM. We do NOT apply the user's gain here —
+      // gaining before capture risks clipping the samples, and the offline pipeline
+      // normalizes anyway. Raw capture preserves the cleanest possible signal.
       const bufferSize = 4096;
       const scriptNode = audioCtx.createScriptProcessor(bufferSize, 1, 1);
       scriptNodeRef.current = scriptNode;
-
       scriptNode.onaudioprocess = (e) => {
         const inputData = e.inputBuffer.getChannelData(0);
-        // Copy the raw PCM samples
         pcmBufferRef.current.push(new Float32Array(inputData));
-        // Output silence to prevent feedback through speakers
-        e.outputBuffer.getChannelData(0).fill(0);
+        e.outputBuffer.getChannelData(0).fill(0); // silence output, no speaker feedback
       };
-
-      gainNode.connect(scriptNode);
-      // ScriptProcessorNode must be connected to destination to fire onaudioprocess events
-      // Output is silenced above so nothing plays through speakers
+      source.connect(scriptNode);
+      // ScriptProcessorNode must reach destination to fire onaudioprocess (output silenced above)
       scriptNode.connect(audioCtx.destination);
 
-      // Live waveform from analyser
+      // MONITOR branch (drives the live meter + beat detector, NOT the capture):
+      // source → live gain → 20-200Hz bandpass → analyser. The user drags the gain
+      // slider until the heart-band meter shows a rhythmic pulse, which tells them the
+      // phone is positioned right BEFORE the 20s recording is spent.
+      const gainNode = audioCtx.createGain();
+      gainNode.gain.value = micGain;
+      gainNodeRef.current = gainNode;
+      const bandpass = audioCtx.createBiquadFilter();
+      bandpass.type = "bandpass";
+      bandpass.frequency.value = 70;   // center of S1/S2 band
+      bandpass.Q.value = 0.7;          // wide-ish to span ~20-200Hz
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 2048;
+      source.connect(gainNode);
+      gainNode.connect(bandpass);
+      bandpass.connect(analyser);
+      // Pull the monitor branch to destination through a muted gain so the graph runs
+      // (an analyser not connected downstream may not be processed in some browsers).
+      const muteGain = audioCtx.createGain();
+      muteGain.gain.value = 0;
+      analyser.connect(muteGain);
+      muteGain.connect(audioCtx.destination);
+
+      // reset live beat tracker
+      beatEnvRef.current = { baseline: 0, lastBeatT: 0, beatTimes: [] };
+      setBeatLevel(0);
+      setLiveBeatBpm(null);
+
+      // Live waveform + heart-band level meter + beat detection
       const waveData = new Float32Array(analyser.fftSize);
       const updateWaveform = () => {
         analyser.getFloatTimeDomainData(waveData);
         const step = Math.floor(waveData.length / 50);
         const points: number[] = [];
+        let sumSq = 0;
+        for (let i = 0; i < waveData.length; i++) sumSq += waveData[i] * waveData[i];
         for (let i = 0; i < waveData.length; i += step) points.push(waveData[i]);
+        const rms = Math.sqrt(sumSq / waveData.length);
+
+        // Meter: map rms (already gained) to 0-1 with a soft ceiling
+        const level = Math.min(1, rms * 3);
+        setBeatLevel(level);
+
+        // Beat detection: adaptive-baseline threshold crossing with 300ms refractory
+        const env = beatEnvRef.current;
+        env.baseline = env.baseline * 0.95 + rms * 0.05; // slow-moving noise floor
+        const t = audioCtx.currentTime;
+        if (rms > env.baseline * 2.2 && rms > 0.02 && t - env.lastBeatT > 0.3) {
+          env.lastBeatT = t;
+          env.beatTimes.push(t);
+          if (env.beatTimes.length > 8) env.beatTimes.shift();
+          setBeatPulse(p => p + 1);
+          if (env.beatTimes.length >= 4) {
+            const intervals: number[] = [];
+            for (let i = 1; i < env.beatTimes.length; i++) intervals.push(env.beatTimes[i] - env.beatTimes[i - 1]);
+            intervals.sort((a, b) => a - b);
+            const medInt = intervals[Math.floor(intervals.length / 2)];
+            const bpm = medInt > 0 ? Math.round(60 / medInt) : 0;
+            if (bpm >= 40 && bpm <= 200) setLiveBeatBpm(bpm);
+          }
+        }
+
         setSoundWaveform(prev => {
           const next = [...prev, ...points];
           return next.slice(-WAVEFORM_POINTS * 2);
@@ -1247,11 +1296,13 @@ export default function Home() {
     } catch {
       setError("Microphone access denied.");
     }
-  }, []);
+  }, [micGain]);
 
   const stopSound = useCallback(async () => {
     if (soundTimerRef.current) clearInterval(soundTimerRef.current);
     cancelAnimationFrame(soundAnimRef.current);
+    gainNodeRef.current = null;
+    setBeatLevel(0);
     // Disconnect and clean up ScriptProcessorNode
     if (scriptNodeRef.current) {
       scriptNodeRef.current.disconnect();
@@ -1657,9 +1708,10 @@ export default function Home() {
                     <p className="text-slate-400 text-xs font-medium">Recording tips:</p>
                     <p className="text-slate-500 text-xs">1. Remove phone case</p>
                     <p className="text-slate-500 text-xs">2. Find your phone&apos;s mic (bottom edge, near charging port)</p>
-                    <p className="text-slate-500 text-xs">3. Press mic end perpendicular to bare chest, left side, between ribs</p>
-                    <p className="text-slate-500 text-xs">4. Stay completely still, breathe normally</p>
+                    <p className="text-slate-500 text-xs">3. Press mic firmly on bare skin, left of breastbone, between ribs</p>
+                    <p className="text-slate-500 text-xs">4. Breathe out, then hold your breath while it records</p>
                     <p className="text-slate-500 text-xs">5. Quiet room &mdash; turn off fans/AC</p>
+                    <p className="text-slate-500 text-xs">6. Drag the sensitivity slider until the beat meter pulses</p>
                   </div>
                 </div>
                 {!modelLoaded && <p className="text-yellow-400 text-xs animate-pulse">Loading AI model...</p>}
@@ -1683,6 +1735,56 @@ export default function Home() {
 
                 {/* Live heart sound waveform */}
                 <LiveWaveform data={soundWaveform} color="#3b82f6" height={140} />
+
+                {/* Live heart-band meter + beat feedback */}
+                <div className="bg-slate-800/60 rounded-xl p-3 flex flex-col gap-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-slate-400">Heart-band signal (20–200Hz)</span>
+                    {liveBeatBpm ? (
+                      <span
+                        key={beatPulse}
+                        className="text-xs font-semibold text-rose-400 flex items-center gap-1 animate-pulse"
+                      >
+                        ♥ ~{liveBeatBpm} bpm
+                      </span>
+                    ) : (
+                      <span className="text-xs text-slate-500">move phone / raise gain…</span>
+                    )}
+                  </div>
+                  <div className="w-full bg-slate-700 rounded-full h-3 overflow-hidden">
+                    <div
+                      className={`h-3 rounded-full transition-[width] duration-75 ${beatLevel > 0.5 ? "bg-rose-500" : beatLevel > 0.2 ? "bg-amber-400" : "bg-blue-500"}`}
+                      style={{ width: `${Math.round(beatLevel * 100)}%` }}
+                    />
+                  </div>
+                  <p className="text-[11px] leading-tight text-slate-500">
+                    {liveBeatBpm
+                      ? "Good — a rhythmic pulse is showing. Hold the phone dead still here."
+                      : "Watch this bar pulse in rhythm with your heart. If it's flat or just jittery noise, reposition the phone and adjust gain below."}
+                  </p>
+                </div>
+
+                {/* Live mic sensitivity (gain) slider */}
+                <div className="flex flex-col gap-1">
+                  <div className="flex items-center justify-between text-xs text-slate-400">
+                    <span>Mic sensitivity</span>
+                    <span className="tabular-nums text-slate-300">{micGain}×</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={1}
+                    max={30}
+                    step={1}
+                    value={micGain}
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      setMicGain(v);
+                      if (gainNodeRef.current) gainNodeRef.current.gain.value = v;
+                    }}
+                    className="w-full accent-rose-500"
+                  />
+                  <p className="text-[11px] text-slate-500">Turn up until the bar reacts to your heartbeat; turn down if it&apos;s maxed out / just noise.</p>
+                </div>
 
                 <div className="w-full bg-slate-700 rounded-full h-1">
                   <div className="bg-blue-500 h-1 rounded-full transition-all" style={{ width: `${((RECORD_DURATION - soundCountdown) / RECORD_DURATION) * 100}%` }} />
