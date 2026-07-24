@@ -1245,7 +1245,16 @@ export default function Home() {
         const inputData = e.inputBuffer.getChannelData(0);
         // Only accumulate into the analysis buffer once ARMED (heartbeat detected).
         // While merely "listening" we run the meter but don't hoard silence/noise.
-        if (capturingRef.current) pcmBufferRef.current.push(new Float32Array(inputData));
+        if (capturingRef.current) {
+          // Apply the user's sensitivity gain to the CAPTURED samples too (not just the
+          // meter). Android with AGC disabled hands back a near-silent raw stream
+          // (RMS < 0.001 → "no signal"); the slider must actually boost the recording.
+          // tanh soft-clips so high gain saturates gracefully instead of hard-clipping.
+          const gain = gainNodeRef.current ? gainNodeRef.current.gain.value : 1;
+          const out = new Float32Array(inputData.length);
+          for (let i = 0; i < inputData.length; i++) out[i] = Math.tanh(inputData[i] * gain);
+          pcmBufferRef.current.push(out);
+        }
         e.outputBuffer.getChannelData(0).fill(0); // silence output, no speaker feedback
       };
       source.connect(scriptNode);
