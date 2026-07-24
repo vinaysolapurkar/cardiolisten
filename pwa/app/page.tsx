@@ -1035,6 +1035,7 @@ export default function Home() {
   // A blind fixed gain just amplifies the noise floor ("radio static"); letting the user
   // tune it against a live heart-band meter is how the working apps (Echoes) hit ~80%.
   const [micGain, setMicGain] = useState(12);
+  const [monitorOn, setMonitorOn] = useState(false); // hear the live amplified mic
   const [beatLevel, setBeatLevel] = useState(0); // 0-1, live heart-band energy
   const [liveBeatBpm, setLiveBeatBpm] = useState<number | null>(null);
   const [beatPulse, setBeatPulse] = useState(0); // increments each detected beat (drives ♥ animation)
@@ -1056,6 +1057,8 @@ export default function Home() {
   const capturingRef = useRef(false); // true only once armed — gates PCM into the analysis buffer
   const armedRef = useRef(false);     // guards the one-time listening→recording transition
   const startCaptureRef = useRef<() => void>(() => {}); // arm() callback, callable from the rAF loop
+  const monitorGainRef = useRef<GainNode | null>(null); // routes live mic → speaker/earphones
+  const monitorOnRef = useRef(false); // live-monitor toggle (read inside audio setup)
   const soundTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const soundAnimRef = useRef<number>(0);
   const soundCtxRef = useRef<AudioContext | null>(null);
@@ -1277,12 +1280,14 @@ export default function Home() {
       source.connect(gainNode);
       gainNode.connect(bandpass);
       bandpass.connect(analyser);
-      // Pull the monitor branch to destination through a muted gain so the graph runs
-      // (an analyser not connected downstream may not be processed in some browsers).
-      const muteGain = audioCtx.createGain();
-      muteGain.gain.value = 0;
-      analyser.connect(muteGain);
-      muteGain.connect(audioCtx.destination);
+      // Monitor gain routes the live gained + band-passed mic to the speaker/earphones.
+      // 0 = silent (also keeps the graph pulled so the analyser runs). When the user
+      // turns on "hear live" we raise it so they can literally hear what the mic picks up.
+      const monitorGain = audioCtx.createGain();
+      monitorGain.gain.value = monitorOnRef.current ? 1 : 0;
+      monitorGainRef.current = monitorGain;
+      analyser.connect(monitorGain);
+      monitorGain.connect(audioCtx.destination);
 
       // reset live beat tracker + arming flags
       beatEnvRef.current = { baseline: 0, lastBeatT: 0, beatTimes: [] };
@@ -1370,6 +1375,7 @@ export default function Home() {
     if (soundTimerRef.current) clearInterval(soundTimerRef.current);
     cancelAnimationFrame(soundAnimRef.current);
     gainNodeRef.current = null;
+    monitorGainRef.current = null;
     capturingRef.current = false;
     armedRef.current = false;
     setBeatLevel(0);
@@ -1394,6 +1400,7 @@ export default function Home() {
     if (soundTimerRef.current) clearInterval(soundTimerRef.current);
     cancelAnimationFrame(soundAnimRef.current);
     gainNodeRef.current = null;
+    monitorGainRef.current = null;
     capturingRef.current = false;
     armedRef.current = false;
     pcmBufferRef.current = [];
@@ -1887,6 +1894,20 @@ export default function Home() {
                   />
                   <p className="text-[11px] text-slate-500">Turn up until the bar reacts to your heartbeat; turn down if it&apos;s maxed out / just noise.</p>
                 </div>
+
+                {/* Live monitor: hear what the mic is picking up in real time */}
+                <button
+                  onClick={() => {
+                    const next = !monitorOn;
+                    setMonitorOn(next);
+                    monitorOnRef.current = next;
+                    if (monitorGainRef.current) monitorGainRef.current.gain.value = next ? 1 : 0;
+                  }}
+                  className={`w-full py-2 rounded-xl text-sm font-medium transition-colors ${monitorOn ? "bg-rose-500/20 border border-rose-500/50 text-rose-200" : "bg-slate-700 hover:bg-slate-600 text-slate-200"}`}
+                >
+                  {monitorOn ? "🔊 Hearing live — tap to mute" : "🎧 Hear live (use earphones)"}
+                </button>
+                <p className="text-[11px] text-slate-500 -mt-1">Plug in earphones and turn this on to hear exactly what the mic captures. Phone speakers can&apos;t reproduce low heart tones well, and may howl (feedback).</p>
 
                 {soundState === "recording" && (
                   <div className="w-full bg-slate-700 rounded-full h-1">
