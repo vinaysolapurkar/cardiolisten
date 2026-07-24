@@ -1178,9 +1178,26 @@ export default function Home() {
     setSoundWaveform([]);
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { sampleRate: { ideal: 44100 }, channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-      });
+      // Disable ALL of the phone's built-in voice processing. Standard flags
+      // (echoCancellation/noiseSuppression/autoGainControl) plus Chrome/Android's
+      // non-standard "goog*" flags — critically googHighpassFilter, which Android
+      // applies by default and which chops off the 20-200Hz band where heart sounds
+      // actually live. Without turning it off, the heartbeat never reaches us on Android.
+      const audioConstraints = {
+        sampleRate: { ideal: 44100 },
+        channelCount: 1,
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+        googEchoCancellation: false,
+        googAutoGainControl: false,
+        googNoiseSuppression: false,
+        googHighpassFilter: false,
+        googTypingNoiseDetection: false,
+        googAudioMirroring: false,
+        voiceIsolation: false,
+      } as MediaTrackConstraints;
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
 
       // RAW PCM capture — no codec, no lossy compression
       // Heart sounds live at 20-150Hz; Opus codec destroys these frequencies.
