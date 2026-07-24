@@ -1580,16 +1580,22 @@ export default function Home() {
         for (let i = 0; i < MAX_FRAMES; i++) paddedFrames.push(i < mfccFrames.length ? mfccFrames[i] : new Float32Array(N_MFCC));
 
         const inputData = new Float32Array(MAX_FRAMES * N_MFCC);
-        for (let i = 0; i < MAX_FRAMES; i++) for (let j = 0; j < N_MFCC; j++) inputData[i * N_MFCC + j] = (paddedFrames[i][j] - norm.mean[j]) / (norm.std[j] + 1e-8);
+        for (let i = 0; i < MAX_FRAMES; i++) for (let j = 0; j < N_MFCC; j++) {
+          const v = (paddedFrames[i][j] - norm.mean[j]) / (norm.std[j] + 1e-8);
+          // Sanitize: a single NaN/Inf MFCC value propagates through the model and makes
+          // the WHOLE prediction NaN, which then silently became a fake 50/50. Replace
+          // non-finite features with 0 so the model always gets valid input.
+          inputData[i * N_MFCC + j] = Number.isFinite(v) ? v : 0;
+        }
 
         const inputTensor = tf.tensor3d(inputData, [1, MAX_FRAMES, N_MFCC]);
         const prediction = modelRef.current!.predict(inputTensor) as tf.Tensor;
         const probs = await prediction.data();
         inputTensor.dispose();
         prediction.dispose();
-        const pNormal = isNaN(probs[0]) ? 0.5 : probs[0];
-        const pAbnormal = isNaN(probs[1]) ? 0.5 : probs[1];
-        segmentResults.push({ normal: pNormal, abnormal: pAbnormal, score: win.score });
+        // Skip segments the model still couldn't score (rather than faking 0.5/0.5).
+        if (!Number.isFinite(probs[0]) || !Number.isFinite(probs[1])) continue;
+        segmentResults.push({ normal: probs[0], abnormal: probs[1], score: win.score });
       }
 
       // Weighted average by quality score
@@ -1616,6 +1622,11 @@ export default function Home() {
       // for a screening tool. Those findings are still surfaced below as non-diagnostic
       // notes, but they don't drive the headline.
       let finalLabel = avgAbnormal > avgNormal ? "abnormal" : "normal";
+      // Only claim a normal/abnormal result when the model is actually decisive. If no
+      // segment scored, or the two classes are near a coin-flip, say so honestly instead
+      // of presenting a meaningless "Normal 50%".
+      const mlDecisive = segmentResults.length > 0 && Math.abs(avgNormal - avgAbnormal) >= 0.30;
+      if (!mlDecisive) finalLabel = "inconclusive";
 
       // Store audio for playback — band-limited to the heart band (NOT the SE-LMS
       // "noise reduction", which cancels the periodic heartbeat and sounds like radio
@@ -1804,7 +1815,7 @@ export default function Home() {
                   <div className="bg-slate-700/30 rounded-lg p-3 text-left space-y-1.5">
                     <p className="text-slate-400 text-xs font-medium">Recording tips:</p>
                     <p className="text-slate-500 text-xs">1. Remove phone case</p>
-                    <p className="text-slate-500 text-xs">2. Find your phone&apos;s mic (bottom edge, near charging port)</p>
+                    <p className="text-slate-500 text-xs">2. Find your phone&apos;s mic (usually bottom edge; top edge on some phones e.g. Pixel)</p>
                     <p className="text-slate-500 text-xs">3. Press mic firmly on bare skin, left of breastbone, between ribs</p>
                     <p className="text-slate-500 text-xs">4. Breathe out, then hold your breath while it records</p>
                     <p className="text-slate-500 text-xs">5. Quiet room &mdash; turn off fans/AC</p>
@@ -1968,21 +1979,29 @@ export default function Home() {
                   </>
                 ) : (
                   <>
-                <div className={`w-14 h-14 rounded-full flex items-center justify-center ${soundResult.label === "normal" ? "bg-green-500/10 border-2 border-green-500" : "bg-yellow-500/10 border-2 border-yellow-500"}`}>
+                <div className={`w-14 h-14 rounded-full flex items-center justify-center ${soundResult.label === "normal" ? "bg-green-500/10 border-2 border-green-500" : soundResult.label === "abnormal" ? "bg-yellow-500/10 border-2 border-yellow-500" : "bg-sky-500/10 border-2 border-sky-500"}`}>
                   {soundResult.label === "normal" ? (
                     <svg className="w-7 h-7 text-green-400" fill="none" stroke="currentColor" strokeWidth={2.5} viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" /></svg>
-                  ) : (
+                  ) : soundResult.label === "abnormal" ? (
                     <svg className="w-7 h-7 text-yellow-400" fill="none" stroke="currentColor" strokeWidth={2.5} viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M12 9v4m0 4h.01M12 2a10 10 0 100 20 10 10 0 000-20z" /></svg>
+                  ) : (
+                    <svg className="w-7 h-7 text-sky-400" fill="none" stroke="currentColor" strokeWidth={2.5} viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z" /></svg>
                   )}
                 </div>
                 <div className="text-center">
-                  <h2 className={`text-xl font-bold ${soundResult.label === "normal" ? "text-green-400" : "text-yellow-400"}`}>
-                    {soundResult.label === "normal" ? "Normal Heart Sound" : "Potential Abnormality"}
+                  <h2 className={`text-xl font-bold ${soundResult.label === "normal" ? "text-green-400" : soundResult.label === "abnormal" ? "text-yellow-400" : "text-sky-400"}`}>
+                    {soundResult.label === "normal" ? "Normal Heart Sound" : soundResult.label === "abnormal" ? "Potential Abnormality" : "Heartbeat Captured"}
                   </h2>
-                  <p className="text-slate-400 text-xs mt-1">Confidence: {(soundResult.confidence * 100).toFixed(1)}%</p>
-                  <p className="text-slate-500 text-xs">Best {soundResult.segmentsAnalyzed} of {Math.floor(RECORD_DURATION / SEGMENT_DURATION)} segments used</p>
+                  {soundResult.label === "inconclusive" ? (
+                    <p className="text-slate-400 text-xs mt-1 max-w-[16rem]">Clear heartbeat recorded{soundResult.heartSoundFindings?.heartRate ? ` (~${soundResult.heartSoundFindings.heartRate} bpm)` : ""}, but the AI couldn&apos;t confidently call it normal vs abnormal. That&apos;s expected from a phone mic — treat the rate below as the reliable part.</p>
+                  ) : (
+                    <>
+                      <p className="text-slate-400 text-xs mt-1">Confidence: {(soundResult.confidence * 100).toFixed(1)}%</p>
+                      <p className="text-slate-500 text-xs">Best {soundResult.segmentsAnalyzed} of {Math.floor(RECORD_DURATION / SEGMENT_DURATION)} segments used</p>
+                    </>
+                  )}
                 </div>
-                <div className="w-full space-y-2">
+                <div className={`w-full space-y-2 ${soundResult.label === "inconclusive" ? "hidden" : ""}`}>
                   <div>
                     <div className="flex justify-between text-xs mb-1"><span className="text-green-400">Normal</span><span className="text-slate-400">{(soundResult.normal * 100).toFixed(1)}%</span></div>
                     <div className="h-2 bg-slate-700 rounded-full overflow-hidden"><div className="h-full bg-green-500 rounded-full" style={{ width: `${soundResult.normal * 100}%` }} /></div>
