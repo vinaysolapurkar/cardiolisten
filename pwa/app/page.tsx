@@ -207,15 +207,25 @@ function autocorrelationHR(envelope: Float32Array, sr: number): { hr: number; qu
   for (let i = 0; i < centered.length; i++) zeroLagCorr += centered[i] * centered[i];
 
   for (let lag = minLag; lag <= Math.min(maxLag, centered.length - 1); lag++) {
-    let corr = 0;
+    let corr = 0, e0 = 0, el = 0;
     const n = centered.length - lag;
-    for (let i = 0; i < n; i++) corr += centered[i] * centered[i + lag];
-    const normalized = zeroLagCorr > 0 ? corr / zeroLagCorr : 0;
+    for (let i = 0; i < n; i++) {
+      corr += centered[i] * centered[i + lag];
+      e0 += centered[i] * centered[i];
+      el += centered[i + lag] * centered[i + lag];
+    }
+    // Proper normalized cross-correlation (Pearson-style, in [-1,1]) over the
+    // overlapping window. This peaks near 1 for a cleanly periodic envelope, so the
+    // quality score is calibrated and comparable across recordings. The old version
+    // divided by the full-length zero-lag energy, which under-scored real heartbeats.
+    const denom = Math.sqrt(e0 * el);
+    const normalized = denom > 0 ? corr / denom : 0;
     if (normalized > bestCorr) {
       bestCorr = normalized;
       bestLag = lag;
     }
   }
+  void zeroLagCorr;
 
   const hr = bestLag > 0 ? Math.round(60 * sr / bestLag) : 0;
   // Quality: autocorrelation peak strength (0-1). Above 0.3 = decent periodicity
@@ -609,12 +619,16 @@ function analyzeHeartSounds(audio: Float32Array, sr: number): HeartSoundFindings
     findings, s1s2Ratio: 1, systolicEnergy: 0, diastolicEnergy: 0
   };
 
-  // ---- STEP 1: Full noise reduction pipeline ----
-  const { cleaned, snrImprovement } = cleanHeartSound(audio, sr);
-  findings.push(`Signal processed: bandpass 25-400Hz → spectral subtraction → cascaded SE-LMS (SNR gain: ${snrImprovement.toFixed(1)}dB)`);
+  // ---- STEP 1: Band-limit to the S1/S2 heart band ----
+  // IMPORTANT: do NOT use the cascaded SE-LMS "noise reduction" here. That adaptive
+  // filter predicts the signal from its own delayed copy and subtracts it — which for
+  // a PERIODIC signal like a heartbeat cancels the heartbeat itself, wiping out the very
+  // periodicity we detect. Plain bandpass preserves the beat.
+  const bandpassed = butterworthBandpass(audio, sr, 20, 200);
+  findings.push("Signal band-limited to 20-200Hz for S1/S2 detection");
 
   // ---- STEP 2: Shannon energy envelope (research-backed, best for S1/S2 detection) ----
-  const envelope = shannonEnergyEnvelope(cleaned, sr);
+  const envelope = shannonEnergyEnvelope(bandpassed, sr);
 
   if (envelope.length < sr * 2) {
     findings.push("Recording too short for reliable analysis");
@@ -802,15 +816,20 @@ function analyzeHeartSounds(audio: Float32Array, sr: number): HeartSoundFindings
   result.systolicEnergy = avgSysEnergy;
   result.diastolicEnergy = avgDiaEnergy;
 
-  // Murmur = sustained energy between sounds significantly above quiet baseline
-  const murmurThreshold = quietBaseline * 6;
-  if (avgSysEnergy > murmurThreshold && systolicCount >= 3) {
+  // Murmur = sustained energy filling the gap between sounds. A TRUE murmur is a real
+  // fraction of the heart-sound peak; ambient/mic noise sits just above the quiet
+  // baseline but nowhere near the peak. Requiring BOTH (well above baseline AND a
+  // meaningful fraction of the S1/S2 peak) stops noisy phone recordings from being
+  // false-flagged as valve disease. These remain screening hints, not a diagnosis.
+  const murmurBaselineFactor = quietBaseline * 10;
+  const murmurPeakFraction = avgPeakAmp * 0.30;
+  if (avgSysEnergy > murmurBaselineFactor && avgSysEnergy > murmurPeakFraction && systolicCount >= 4) {
     result.systolicMurmur = true;
-    findings.push("Systolic murmur pattern detected — may indicate valve disease or post-MI complication");
+    findings.push("Possible systolic murmur — not diagnostic; consider a clinician follow-up if persistent");
   }
-  if (avgDiaEnergy > murmurThreshold && diastolicCount >= 3) {
+  if (avgDiaEnergy > murmurBaselineFactor && avgDiaEnergy > murmurPeakFraction && diastolicCount >= 4) {
     result.diastolicMurmur = true;
-    findings.push("Diastolic murmur pattern detected — may indicate valve insufficiency");
+    findings.push("Possible diastolic murmur — not diagnostic; consider a clinician follow-up if persistent");
   }
 
   // ---- STEP 10: Additional findings ----
@@ -1575,15 +1594,17 @@ export default function Home() {
       const longSegment = resampled.slice(bestWin.start, Math.min(bestWin.start + longWindowSize, resampled.length));
       const heartSoundFindings = analyzeHeartSounds(longSegment, SAMPLE_RATE);
 
-      // If DSP detects serious findings, adjust the label
+      // Headline verdict comes from the ML classifier only. We deliberately do NOT let
+      // the DSP murmur/S3/S4 heuristics flip this to "abnormal": from a phone mic they
+      // are far too unreliable, and a false "valve disease" alarm is the worst outcome
+      // for a screening tool. Those findings are still surfaced below as non-diagnostic
+      // notes, but they don't drive the headline.
       let finalLabel = avgAbnormal > avgNormal ? "abnormal" : "normal";
-      if (heartSoundFindings.s3Suspected || heartSoundFindings.s4Suspected ||
-          heartSoundFindings.systolicMurmur || heartSoundFindings.diastolicMurmur) {
-        finalLabel = "abnormal";
-      }
 
-      // Store CLEANED audio for playback — run full noise reduction pipeline
-      const { cleaned: cleanedAudio, snrImprovement: snrGain } = cleanHeartSound(resampled, SAMPLE_RATE);
+      // Store audio for playback — band-limited to the heart band (NOT the SE-LMS
+      // "noise reduction", which cancels the periodic heartbeat and sounds like radio
+      // static). Bandpass keeps the actual lub-dub audible.
+      const cleanedAudio = butterworthBandpass(resampled, SAMPLE_RATE, 20, 200);
       const playbackAudio = new Float32Array(cleanedAudio.length);
       let maxAmp = 0;
       for (let i = 0; i < cleanedAudio.length; i++) {
@@ -1596,9 +1617,9 @@ export default function Home() {
       }
       filteredAudioRef.current = playbackAudio;
 
-      // If noise reduction couldn't extract any signal (negative SNR gain)
-      // AND DSP didn't detect S1/S2, the recording has no heart sounds — override ML
-      if (snrGain < 0.5 && !heartSoundFindings.s1s2Detected) {
+      // Reject only when NO periodic heartbeat was found (S1/S2 not detected). The old
+      // gate also required a broken snrGain metric and was rejecting clean heartbeats.
+      if (!heartSoundFindings.s1s2Detected) {
         finalLabel = "low_quality";
         qualityReport.pass = false;
         if (!qualityReport.issues.includes("No heart sounds detected in signal")) {
@@ -1946,27 +1967,27 @@ export default function Home() {
                     <div className="text-xs text-slate-400 font-medium mb-2">Detailed Findings</div>
                     <div className="space-y-2">
                       {soundResult.heartSoundFindings.s3Suspected && (
-                        <div className="flex items-start gap-2 bg-red-500/10 border border-red-500/30 rounded-lg p-2">
-                          <span className="text-red-400 text-sm mt-0.5">!</span>
-                          <span className="text-red-300 text-xs">S3 Gallop &mdash; suggests heart failure / volume overload</span>
+                        <div className="flex items-start gap-2 bg-amber-500/10 border border-amber-500/25 rounded-lg p-2">
+                          <span className="text-amber-400 text-sm mt-0.5">i</span>
+                          <span className="text-amber-200/90 text-xs">Possible extra sound in early diastole (S3). Not diagnostic &mdash; mention to a doctor if you have symptoms.</span>
                         </div>
                       )}
                       {soundResult.heartSoundFindings.s4Suspected && (
-                        <div className="flex items-start gap-2 bg-red-500/10 border border-red-500/30 rounded-lg p-2">
-                          <span className="text-red-400 text-sm mt-0.5">!</span>
-                          <span className="text-red-300 text-xs">S4 Gallop &mdash; suggests stiff ventricle / acute MI</span>
+                        <div className="flex items-start gap-2 bg-amber-500/10 border border-amber-500/25 rounded-lg p-2">
+                          <span className="text-amber-400 text-sm mt-0.5">i</span>
+                          <span className="text-amber-200/90 text-xs">Possible extra sound in late diastole (S4). Not diagnostic &mdash; a phone mic can&apos;t confirm this.</span>
                         </div>
                       )}
                       {soundResult.heartSoundFindings.systolicMurmur && (
-                        <div className="flex items-start gap-2 bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-2">
-                          <span className="text-yellow-400 text-sm mt-0.5">!</span>
-                          <span className="text-yellow-300 text-xs">Systolic murmur &mdash; may indicate valve disease or post-MI complication</span>
+                        <div className="flex items-start gap-2 bg-amber-500/10 border border-amber-500/25 rounded-lg p-2">
+                          <span className="text-amber-400 text-sm mt-0.5">i</span>
+                          <span className="text-amber-200/90 text-xs">Some sound between beats (possible systolic murmur). Often just background noise on a phone &mdash; not diagnostic.</span>
                         </div>
                       )}
                       {soundResult.heartSoundFindings.diastolicMurmur && (
-                        <div className="flex items-start gap-2 bg-yellow-500/10 border border-yellow-500/30 rounded-lg p-2">
-                          <span className="text-yellow-400 text-sm mt-0.5">!</span>
-                          <span className="text-yellow-300 text-xs">Diastolic murmur &mdash; may indicate valve insufficiency</span>
+                        <div className="flex items-start gap-2 bg-amber-500/10 border border-amber-500/25 rounded-lg p-2">
+                          <span className="text-amber-400 text-sm mt-0.5">i</span>
+                          <span className="text-amber-200/90 text-xs">Some sound between beats (possible diastolic murmur). Often just background noise on a phone &mdash; not diagnostic.</span>
                         </div>
                       )}
                       {soundResult.heartSoundFindings.heartRate > 0 && (
