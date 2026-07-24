@@ -18,7 +18,7 @@ const WAVEFORM_POINTS = 300; // points visible in live waveform
 
 type Tab = "pulse" | "sound" | "report";
 type PulseState = "idle" | "measuring" | "processing" | "done";
-type SoundState = "idle" | "recording" | "processing" | "done";
+type SoundState = "idle" | "listening" | "recording" | "processing" | "done";
 
 interface PulseResult {
   hr: number;
@@ -1034,6 +1034,9 @@ export default function Home() {
   const scriptNodeRef = useRef<ScriptProcessorNode | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null); // live-adjustable capture gain
   const beatEnvRef = useRef<{ baseline: number; lastBeatT: number; beatTimes: number[] }>({ baseline: 0, lastBeatT: 0, beatTimes: [] });
+  const capturingRef = useRef(false); // true only once armed — gates PCM into the analysis buffer
+  const armedRef = useRef(false);     // guards the one-time listening→recording transition
+  const startCaptureRef = useRef<() => void>(() => {}); // arm() callback, callable from the rAF loop
   const soundTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const soundAnimRef = useRef<number>(0);
   const soundCtxRef = useRef<AudioContext | null>(null);
@@ -1221,7 +1224,9 @@ export default function Home() {
       scriptNodeRef.current = scriptNode;
       scriptNode.onaudioprocess = (e) => {
         const inputData = e.inputBuffer.getChannelData(0);
-        pcmBufferRef.current.push(new Float32Array(inputData));
+        // Only accumulate into the analysis buffer once ARMED (heartbeat detected).
+        // While merely "listening" we run the meter but don't hoard silence/noise.
+        if (capturingRef.current) pcmBufferRef.current.push(new Float32Array(inputData));
         e.outputBuffer.getChannelData(0).fill(0); // silence output, no speaker feedback
       };
       source.connect(scriptNode);
@@ -1251,10 +1256,30 @@ export default function Home() {
       analyser.connect(muteGain);
       muteGain.connect(audioCtx.destination);
 
-      // reset live beat tracker
+      // reset live beat tracker + arming flags
       beatEnvRef.current = { baseline: 0, lastBeatT: 0, beatTimes: [] };
       setBeatLevel(0);
       setLiveBeatBpm(null);
+      capturingRef.current = false;
+      armedRef.current = false;
+
+      // arm() = "the heartbeat was found (or user forced it): start the real 20s capture".
+      // Until this fires we stay in "listening": mic + meter live, but nothing is recorded.
+      const arm = () => {
+        if (armedRef.current) return;
+        armedRef.current = true;
+        pcmBufferRef.current = []; // drop the listening-phase noise, capture fresh from here
+        capturingRef.current = true;
+        setSoundState("recording");
+        setSoundCountdown(RECORD_DURATION);
+        let remaining = RECORD_DURATION;
+        soundTimerRef.current = setInterval(() => {
+          remaining--;
+          setSoundCountdown(remaining);
+          if (remaining <= 0) stopSound();
+        }, 1000);
+      };
+      startCaptureRef.current = arm; // exposed to the manual "Record now" button
 
       // Live waveform + heart-band level meter + beat detection
       const waveData = new Float32Array(analyser.fftSize);
@@ -1286,7 +1311,11 @@ export default function Home() {
             intervals.sort((a, b) => a - b);
             const medInt = intervals[Math.floor(intervals.length / 2)];
             const bpm = medInt > 0 ? Math.round(60 / medInt) : 0;
-            if (bpm >= 40 && bpm <= 200) setLiveBeatBpm(bpm);
+            if (bpm >= 40 && bpm <= 200) {
+              setLiveBeatBpm(bpm);
+              // Heartbeat locked → auto-start the real recording.
+              if (!armedRef.current) arm();
+            }
           }
         }
 
@@ -1301,15 +1330,9 @@ export default function Home() {
       // Store stream ref for cleanup
       soundStreamRef.current = stream;
 
-      setSoundState("recording");
+      // Enter LISTENING mode (not recording yet). arm() flips us to "recording".
+      setSoundState("listening");
       setSoundCountdown(RECORD_DURATION);
-
-      let remaining = RECORD_DURATION;
-      soundTimerRef.current = setInterval(() => {
-        remaining--;
-        setSoundCountdown(remaining);
-        if (remaining <= 0) stopSound();
-      }, 1000);
     } catch {
       setError("Microphone access denied.");
     }
@@ -1319,6 +1342,8 @@ export default function Home() {
     if (soundTimerRef.current) clearInterval(soundTimerRef.current);
     cancelAnimationFrame(soundAnimRef.current);
     gainNodeRef.current = null;
+    capturingRef.current = false;
+    armedRef.current = false;
     setBeatLevel(0);
     // Disconnect and clean up ScriptProcessorNode
     if (scriptNodeRef.current) {
@@ -1333,6 +1358,24 @@ export default function Home() {
     }
     // Process captured PCM
     await processSound();
+  }, []);
+
+  // Tear down the mic without processing — used to cancel while still LISTENING
+  // (nothing has been captured yet, so there is nothing to analyze).
+  const cancelSound = useCallback(() => {
+    if (soundTimerRef.current) clearInterval(soundTimerRef.current);
+    cancelAnimationFrame(soundAnimRef.current);
+    gainNodeRef.current = null;
+    capturingRef.current = false;
+    armedRef.current = false;
+    pcmBufferRef.current = [];
+    setBeatLevel(0);
+    setLiveBeatBpm(null);
+    if (scriptNodeRef.current) { scriptNodeRef.current.disconnect(); scriptNodeRef.current = null; }
+    if (soundCtxRef.current) { soundCtxRef.current.close(); soundCtxRef.current = null; }
+    if (soundStreamRef.current) { soundStreamRef.current.getTracks().forEach(t => t.stop()); soundStreamRef.current = null; }
+    setSoundWaveform([]);
+    setSoundState("idle");
   }, []);
 
   const playFilteredAudio = useCallback(() => {
@@ -1738,20 +1781,32 @@ export default function Home() {
               </div>
             )}
 
-            {soundState === "recording" && (
+            {(soundState === "listening" || soundState === "recording") && (
               <div className="flex flex-col gap-3">
                 <div className="flex items-center justify-between">
-                  <div>
-                    <p className="text-blue-400 font-medium text-sm animate-pulse">Recording Heart Sound</p>
-                    <p className="text-slate-500 text-xs">AI noise reduction active</p>
-                  </div>
-                  <div className="w-12 h-12 rounded-full bg-blue-500 flex items-center justify-center flex-shrink-0">
-                    <span className="text-lg font-bold">{soundCountdown}</span>
-                  </div>
+                  {soundState === "listening" ? (
+                    <>
+                      <div>
+                        <p className="text-amber-400 font-medium text-sm animate-pulse">Listening for your heartbeat…</p>
+                        <p className="text-slate-500 text-xs">Recording starts automatically once it locks on</p>
+                      </div>
+                      <div className="w-12 h-12 rounded-full border-2 border-amber-400 border-t-transparent animate-spin flex-shrink-0" />
+                    </>
+                  ) : (
+                    <>
+                      <div>
+                        <p className="text-rose-400 font-medium text-sm animate-pulse">● Recording Heart Sound</p>
+                        <p className="text-slate-500 text-xs">Heartbeat locked — hold still</p>
+                      </div>
+                      <div className="w-12 h-12 rounded-full bg-rose-500 flex items-center justify-center flex-shrink-0">
+                        <span className="text-lg font-bold">{soundCountdown}</span>
+                      </div>
+                    </>
+                  )}
                 </div>
 
                 {/* Live heart sound waveform */}
-                <LiveWaveform data={soundWaveform} color="#3b82f6" height={140} />
+                <LiveWaveform data={soundWaveform} color={soundState === "listening" ? "#f59e0b" : "#f43f5e"} height={140} />
 
                 {/* Live heart-band meter + beat feedback */}
                 <div className="bg-slate-800/60 rounded-xl p-3 flex flex-col gap-2">
@@ -1803,13 +1858,26 @@ export default function Home() {
                   <p className="text-[11px] text-slate-500">Turn up until the bar reacts to your heartbeat; turn down if it&apos;s maxed out / just noise.</p>
                 </div>
 
-                <div className="w-full bg-slate-700 rounded-full h-1">
-                  <div className="bg-blue-500 h-1 rounded-full transition-all" style={{ width: `${((RECORD_DURATION - soundCountdown) / RECORD_DURATION) * 100}%` }} />
-                </div>
+                {soundState === "recording" && (
+                  <div className="w-full bg-slate-700 rounded-full h-1">
+                    <div className="bg-rose-500 h-1 rounded-full transition-all" style={{ width: `${((RECORD_DURATION - soundCountdown) / RECORD_DURATION) * 100}%` }} />
+                  </div>
+                )}
 
-                <button onClick={() => stopSound()} className="w-full py-2 bg-slate-700 hover:bg-slate-600 rounded-xl text-sm font-medium transition-colors">
-                  Stop & Analyze
-                </button>
+                {soundState === "listening" ? (
+                  <div className="flex gap-2">
+                    <button onClick={() => startCaptureRef.current()} className="flex-1 py-2 bg-blue-500 hover:bg-blue-600 rounded-xl text-sm font-medium transition-colors">
+                      Record now
+                    </button>
+                    <button onClick={() => cancelSound()} className="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded-xl text-sm font-medium transition-colors">
+                      Cancel
+                    </button>
+                  </div>
+                ) : (
+                  <button onClick={() => stopSound()} className="w-full py-2 bg-slate-700 hover:bg-slate-600 rounded-xl text-sm font-medium transition-colors">
+                    Stop & Analyze
+                  </button>
+                )}
               </div>
             )}
 
