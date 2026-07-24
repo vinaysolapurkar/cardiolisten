@@ -1176,6 +1176,12 @@ export default function Home() {
       // We capture uncompressed samples and do ALL filtering offline in DSP.
       const audioCtx = new AudioContext();
       soundCtxRef.current = audioCtx;
+      // Mobile browsers (iOS Safari especially) start the AudioContext SUSPENDED.
+      // A suspended context never fires onaudioprocess, so the PCM buffer stays empty
+      // and nothing gets recorded. Resume it inside this user-gesture-initiated call.
+      if (audioCtx.state === "suspended") {
+        try { await audioCtx.resume(); } catch {}
+      }
       nativeSampleRateRef.current = audioCtx.sampleRate; // Store actual rate (48000 on most phones)
       const source = audioCtx.createMediaStreamSource(stream);
 
